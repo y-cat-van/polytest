@@ -6,3 +6,5 @@ __pycache__/
 env/
 venv/
 *.csv
+market_history_cache.json
+monitor_settings.json

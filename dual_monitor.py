@@ -10,6 +10,28 @@ import websocket
 import datetime
 import os
 
+SETTINGS_FILE = "monitor_settings.json"
+
+def load_settings():
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r") as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
+
+def save_settings():
+    settings = {
+        "arb_sum_threshold": st.session_state.get("arb_sum_threshold", 0.8),
+        "arb_drop_threshold": st.session_state.get("arb_drop_threshold", 0.03),
+        "arb_time_threshold": st.session_state.get("arb_time_threshold", 5)
+    }
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump(settings, f)
+    # Force reload to update widgets if needed? Not strictly necessary if session state is sync'd
+
+
 # Suppress InsecureRequestWarning
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -38,6 +60,7 @@ def parse_json_field(field_value):
             return []
     return field_value
 
+@st.cache_data(ttl=15)
 def fetch_market_data(slug):
     try:
         url = f"{GAMMA_API_URL}/events"
@@ -57,6 +80,67 @@ def fetch_market_data(slug):
     except Exception as e:
         return None, f"Error fetching event: {str(e)}"
 
+@st.cache_data(ttl=15) # Keep short TTL or remove caching if manual update
+def get_market_winner(slug):
+    try:
+        url = f"{GAMMA_API_URL}/events"
+        params = {"slug": slug}
+        resp = requests.get(url, params=params, verify=False, timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data and isinstance(data, list) and len(data) > 0:
+                markets = data[0].get("markets", [])
+                if markets:
+                    m = markets[0]
+                    
+                    # Method 1: Check outcomePrices (Reliable for resolved markets)
+                    # e.g. outcomePrices: ["0", "1"] means outcomes[1] won
+                    prices = m.get("outcomePrices")
+                    outcomes = parse_json_field(m.get("outcomes"))
+                    
+                    # Need to handle string json parsing if outcomes is string
+                    if isinstance(outcomes, str):
+                        try: outcomes = json.loads(outcomes)
+                        except: pass
+                        
+                    if isinstance(prices, str):
+                        try: prices = json.loads(prices)
+                        except: pass
+                    
+                    if prices and outcomes and len(prices) == len(outcomes):
+                        # Find index where price is "1"
+                        for i, p in enumerate(prices):
+                            try:
+                                # Debugging showed prices are strings like "1", "0"
+                                if float(p) >= 0.99: 
+                                    return outcomes[i]
+                            except:
+                                pass
+                    
+                    # Method 2: Check market details (tokens winner) - Fallback
+                    mid = m.get("id")
+                    if mid:
+                        m_url = f"{GAMMA_API_URL}/markets/{mid}"
+                        m_resp = requests.get(m_url, verify=False, timeout=5)
+                        if m_resp.status_code == 200:
+                            m_data = m_resp.json()
+                            if "tokens" in m_data:
+                                for t in m_data["tokens"]:
+                                    if t.get("winner") == True:
+                                        return t.get("outcome", "Unknown")
+                    
+                    # Check if it's just not resolved yet
+                    if m.get("closed"):
+                        return "Pending (Closed)"
+                    else:
+                        return "Active"
+                        
+            else:
+                return "Not Found"
+    except:
+        pass
+    return "Error"
+
 def save_result(market_slug, result, end_time):
     """Append result to CSV."""
     file_exists = os.path.isfile(HISTORY_FILE)
@@ -72,9 +156,12 @@ def save_round_history(btc_slug, eth_slug):
     # Check if this pair already exists to avoid duplicates
     if file_exists:
         try:
-            df = pd.read_csv(ROUND_HISTORY_FILE)
-            if not df.empty and ((df['btc_slug'] == btc_slug) & (df['eth_slug'] == eth_slug)).any():
-                return
+            with open(ROUND_HISTORY_FILE, "r") as f:
+                lines = f.readlines()
+                # Check last 50 lines for duplicates
+                for line in reversed(lines[-50:]):
+                    if btc_slug in line and eth_slug in line:
+                        return
         except:
             pass
             
@@ -101,6 +188,7 @@ class PolymarketWSManager:
         self.subscribed_tokens = set()
         self.lock = threading.Lock()
         self.is_running = False
+        self.last_update = 0.0
 
     def start(self):
         if self.is_running:
@@ -197,6 +285,7 @@ class PolymarketWSManager:
             except: pass
         with self.lock:
             self.prices[token_id] = {"bid": best_bid, "ask": best_ask}
+            self.last_update = time.time()
 
     def _update_price_direct(self, token_id, bid, ask):
         with self.lock:
@@ -204,6 +293,7 @@ class PolymarketWSManager:
             new_bid = bid if bid is not None else current["bid"]
             new_ask = ask if ask is not None else current["ask"]
             self.prices[token_id] = {"bid": new_bid, "ask": new_ask}
+            self.last_update = time.time()
 
     def get_price(self, token_id):
         with self.lock:
@@ -238,10 +328,23 @@ def get_ws_manager():
 # --- Main App ---
 st.set_page_config(page_title="Dual Crypto Monitor", layout="wide")
 
+# Ensure ws_manager is initialized and running
 ws_manager = get_ws_manager()
+if not ws_manager.is_running:
+    ws_manager.start()
 
 # --- Navigation ---
 page = st.sidebar.radio("Navigation", ["Monitor", "Arb History", "Market Results History"])
+
+# Load settings on startup (moved after page config)
+loaded_settings = load_settings()
+# Always initialize session_state with loaded settings or defaults if not present
+if "arb_sum_threshold" not in st.session_state:
+    st.session_state["arb_sum_threshold"] = loaded_settings.get("arb_sum_threshold", 0.8)
+if "arb_drop_threshold" not in st.session_state:
+    st.session_state["arb_drop_threshold"] = loaded_settings.get("arb_drop_threshold", 0.03)
+if "arb_time_threshold" not in st.session_state:
+    st.session_state["arb_time_threshold"] = loaded_settings.get("arb_time_threshold", 5)
 
 # --- Helper Functions ---
 def get_latest_active_slug(prefix):
@@ -352,155 +455,181 @@ if page == "Monitor":
         # --- Real-time Loop ---
         if not btc_closed and not eth_closed and btc_tokens and eth_tokens:
             price_placeholder = st.empty()
+            last_render_ts = 0.0
             
             while True:
-                # Fetch Prices
-                btc_prices = {t["outcome"]: ws_manager.get_price(t["token_id"]) for t in btc_tokens}
-                eth_prices = {t["outcome"]: ws_manager.get_price(t["token_id"]) for t in eth_tokens}
-                
-                # Display
-                with price_placeholder.container():
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.subheader("BTC Market")
-                        st.caption(f"Slug: {btc_slug}")
-                        
-                        if btc_markets:
-                            m = btc_markets[0]
-                            st.info(m.get("question"))
-                        
-                        for t in btc_tokens:
-                            p = btc_prices[t["outcome"]]
-                            st.metric(f"BTC {t['outcome']}", f"Ask: {p['ask']}", f"Bid: {p['bid']}")
-                    with c2:
-                        st.subheader("ETH Market")
-                        st.caption(f"Slug: {eth_slug}")
-                        
-                        if eth_markets:
-                            m = eth_markets[0]
-                            st.info(m.get("question"))
-                            
-                        for t in eth_tokens:
-                            p = eth_prices[t["outcome"]]
-                            st.metric(f"ETH {t['outcome']}", f"Ask: {p['ask']}", f"Bid: {p['bid']}")
+                # Check for updates (Low Latency Polling)
+                current_update_ts = ws_manager.last_update
+                if current_update_ts > last_render_ts:
+                    last_render_ts = current_update_ts
                     
-                    # EndDate Logic for Countdown
-                    try:
-                        end_date_iso = None
-                        if btc_markets and len(btc_markets) > 0:
-                            end_date_iso = btc_markets[0].get("endDate")
+                    # Fetch Prices
+                    btc_prices = {t["outcome"]: ws_manager.get_price(t["token_id"]) for t in btc_tokens}
+                    eth_prices = {t["outcome"]: ws_manager.get_price(t["token_id"]) for t in eth_tokens}
+                    
+                    # Display
+                    with price_placeholder.container():
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            st.subheader("BTC Market")
+                            st.caption(f"Slug: {btc_slug}")
                             
-                        if end_date_iso:
-                            end_dt = datetime.datetime.fromisoformat(end_date_iso.replace("Z", "+00:00"))
-                            now_dt = datetime.datetime.now(datetime.timezone.utc)
-                            seconds_left = (end_dt - now_dt).total_seconds()
+                            if btc_markets:
+                                m = btc_markets[0]
+                                st.info(m.get("question"))
                             
-                            if seconds_left > 0:
-                                mins = int(seconds_left // 60)
-                                secs = int(seconds_left % 60)
-                                progress = max(0.0, min(1.0, 1.0 - (seconds_left / 900.0)))
-                                st.progress(progress, text=f"Time Remaining: {mins}m {secs}s")
-                            else:
-                                st.progress(1.0, text="Time Remaining: 0m 0s (Closing...)")
-                        else:
-                            parts = btc_slug.split("-")
-                            end_ts = int(parts[-1])
-                            now_ts = int(time.time())
-                            seconds_left = max(0, end_ts - now_ts)
-                            mins = seconds_left // 60
-                            secs = seconds_left % 60
-                            st.progress(max(0.0, min(1.0, 1.0 - (seconds_left / 900.0))), text=f"Time Remaining: {mins}m {secs}s")
-                    except Exception as e:
-                         st.write("Time Remaining: N/A")
-
-                    # --- Calc Logic ---
-                    try:
-                        def safe_float(val):
-                            try: return float(val)
-                            except: return 999.0
+                            for t in btc_tokens:
+                                p = btc_prices[t["outcome"]]
+                                st.metric(f"BTC {t['outcome']}", f"Ask: {p['ask']}", f"Bid: {p['bid']}")
+                        with c2:
+                            st.subheader("ETH Market")
+                            st.caption(f"Slug: {eth_slug}")
+                            
+                            if eth_markets:
+                                m = eth_markets[0]
+                                st.info(m.get("question"))
+                                
+                            for t in eth_tokens:
+                                p = eth_prices[t["outcome"]]
+                                st.metric(f"ETH {t['outcome']}", f"Ask: {p['ask']}", f"Bid: {p['bid']}")
                         
-                        def get_ask(prices, outcome_name):
-                            val = prices.get(outcome_name, {}).get("ask")
-                            if val: return safe_float(val)
-                            if outcome_name == "Yes": return safe_float(prices.get("Up", {}).get("ask"))
-                            if outcome_name == "No": return safe_float(prices.get("Down", {}).get("ask"))
-                            return 999.0
-
-                        btc_up_ask = get_ask(btc_prices, "Yes")
-                        btc_down_ask = get_ask(btc_prices, "No")
-                        eth_up_ask = get_ask(eth_prices, "Yes")
-                        eth_down_ask = get_ask(eth_prices, "No")
-                        
-                        sum_1 = btc_up_ask + eth_down_ask
-                        sum_2 = btc_down_ask + eth_up_ask
-                        
-                        st.divider()
-                        st.write(f"**BTC Up + ETH Down (Ask Sum): {sum_1:.4f}**")
-                        st.write(f"**BTC Down + ETH Up (Ask Sum): {sum_2:.4f}**")
-                        
-                        # Record Logic
-                        # Use session state settings if available (defaults to 0.8 / 0.03 if not set in UI yet)
-                        threshold_sum = st.session_state.get("arb_sum_threshold", 0.8)
-                        threshold_drop = st.session_state.get("arb_drop_threshold", 0.03)
-                        threshold_time_mins = st.session_state.get("arb_time_threshold", 5)
-
-                        # Check time constraint
-                        # We need to know when the round ends.
-                        # BTC and ETH usually end at same time for these pairs.
-                        # Let's assume 15m intervals ending at X:00, X:15, X:30, X:45
-                        # Or parse from btc_markets if available
-                        should_record_time = True
+                        # EndDate Logic for Countdown
                         try:
-                            # Try to get end time from API data first
-                            end_ts = 0
+                            end_date_iso = None
                             if btc_markets and len(btc_markets) > 0:
                                 end_date_iso = btc_markets[0].get("endDate")
-                                if end_date_iso:
-                                    end_dt = datetime.datetime.fromisoformat(end_date_iso.replace("Z", "+00:00"))
-                                    end_ts = end_dt.timestamp()
-                            
-                            # Fallback to slug parsing
-                            if end_ts == 0:
+                                
+                            if end_date_iso:
+                                end_dt = datetime.datetime.fromisoformat(end_date_iso.replace("Z", "+00:00"))
+                                now_dt = datetime.datetime.now(datetime.timezone.utc)
+                                seconds_left = (end_dt - now_dt).total_seconds()
+                                
+                                if seconds_left > 0:
+                                    mins = int(seconds_left // 60)
+                                    secs = int(seconds_left % 60)
+                                    progress = max(0.0, min(1.0, 1.0 - (seconds_left / 900.0)))
+                                    st.progress(progress, text=f"Time Remaining: {mins}m {secs}s")
+                                else:
+                                    st.progress(1.0, text="Time Remaining: 0m 0s (Closing...)")
+                            else:
                                 parts = btc_slug.split("-")
                                 end_ts = int(parts[-1])
-                            
-                            now_ts = time.time()
-                            seconds_left = end_ts - now_ts
-                            
-                            if seconds_left < (threshold_time_mins * 60):
-                                should_record_time = False
-                        except:
-                            pass # If error, default to True to not miss data
+                                now_ts = int(time.time())
+                                seconds_left = max(0, end_ts - now_ts)
+                                mins = seconds_left // 60
+                                secs = seconds_left % 60
+                                st.progress(max(0.0, min(1.0, 1.0 - (seconds_left / 900.0))), text=f"Time Remaining: {mins}m {secs}s")
+                        except Exception as e:
+                            st.write("Time Remaining: N/A")
 
-                        if should_record_time:
-                            if sum_1 <= threshold_sum:
-                                # Logic: Only record if significantly lower than previous minimum
-                                # or if no minimum recorded yet (initially 1.0)
+                        # --- Calc Logic ---
+                        try:
+                            def safe_float(val):
+                                try: return float(val)
+                                except: return 999.0
+                            
+                            def get_ask(prices, outcome_name):
+                                val = prices.get(outcome_name, {}).get("ask")
+                                if val: return safe_float(val)
+                                if outcome_name == "Yes": return safe_float(prices.get("Up", {}).get("ask"))
+                                if outcome_name == "No": return safe_float(prices.get("Down", {}).get("ask"))
+                                return 999.0
+
+                            btc_up_ask = get_ask(btc_prices, "Yes")
+                            btc_down_ask = get_ask(btc_prices, "No")
+                            eth_up_ask = get_ask(eth_prices, "Yes")
+                            eth_down_ask = get_ask(eth_prices, "No")
+                            
+                            sum_1 = btc_up_ask + eth_down_ask
+                            sum_2 = btc_down_ask + eth_up_ask
+                            
+                            st.divider()
+                            st.write(f"**BTC Up + ETH Down (Ask Sum): {sum_1:.4f}**")
+                            st.write(f"**BTC Down + ETH Up (Ask Sum): {sum_2:.4f}**")
+                            
+                            # Record Logic
+                            # Use session state settings if available (defaults to 0.8 / 0.03 if not set in UI yet)
+                            threshold_sum = st.session_state.get("arb_sum_threshold", 0.8)
+                            threshold_drop = st.session_state.get("arb_drop_threshold", 0.03)
+                            threshold_time_mins = st.session_state.get("arb_time_threshold", 5)
+
+                            # Check time constraint
+                            # We need to know when the round ends.
+                            # BTC and ETH usually end at same time for these pairs.
+                            # Let's assume 15m intervals ending at X:00, X:15, X:30, X:45
+                            # Or parse from btc_markets if available
+                            should_record_time = True
+                            try:
+                                # Try to get end time from API data first
+                                end_ts = 0
+                                if btc_markets and len(btc_markets) > 0:
+                                    end_date_iso = btc_markets[0].get("endDate")
+                                    if end_date_iso:
+                                        end_dt = datetime.datetime.fromisoformat(end_date_iso.replace("Z", "+00:00"))
+                                        end_ts = end_dt.timestamp()
                                 
-                                # Current logic: if sum_1 < min_sum_1
-                                # New logic: if sum_1 < (min_sum_1 - threshold_drop) OR (min_sum_1 == 1.0)
+                                # Fallback to slug parsing
+                                if end_ts == 0:
+                                    parts = btc_slug.split("-")
+                                    end_ts = int(parts[-1])
                                 
-                                if st.session_state["min_sum_1"] == 1.0 or sum_1 < (st.session_state["min_sum_1"] - threshold_drop):
-                                    save_arb_opportunity(btc_slug, eth_slug, "BTC_Up_ETH_Down", sum_1, btc_up_ask, eth_down_ask)
-                                    st.session_state["min_sum_1"] = sum_1
-                                    st.toast(f"New Low Sum 1: {sum_1:.4f} Recorded!", icon="📉")
+                                now_ts = time.time()
+                                seconds_left = end_ts - now_ts
+                                
+                                if seconds_left < (threshold_time_mins * 60):
+                                    should_record_time = False
+                            except:
+                                pass # If error, default to True to not miss data
+
+                            if should_record_time:
+                                if sum_1 <= threshold_sum:
+                                    # Logic: Only record if significantly lower than previous minimum
+                                    # or if no minimum recorded yet (initially 1.0)
                                     
-                            if sum_2 <= threshold_sum:
-                                if st.session_state["min_sum_2"] == 1.0 or sum_2 < (st.session_state["min_sum_2"] - threshold_drop):
-                                    save_arb_opportunity(btc_slug, eth_slug, "BTC_Down_ETH_Up", sum_2, btc_down_ask, eth_up_ask)
-                                    st.session_state["min_sum_2"] = sum_2
-                                    st.toast(f"New Low Sum 2: {sum_2:.4f} Recorded!", icon="📉")
-                                
-                    except ValueError:
-                        pass # Data loading
-                        
-                    st.caption(f"Last Update: {time.strftime('%H:%M:%S')}")
+                                    # Current logic: if sum_1 < min_sum_1
+                                    # New logic: if sum_1 < (min_sum_1 - threshold_drop) OR (min_sum_1 == 1.0)
+                                    
+                                    if st.session_state["min_sum_1"] == 1.0 or sum_1 < (st.session_state["min_sum_1"] - threshold_drop):
+                                        save_arb_opportunity(btc_slug, eth_slug, "BTC_Up_ETH_Down", sum_1, btc_up_ask, eth_down_ask)
+                                        st.session_state["min_sum_1"] = sum_1
+                                        st.toast(f"New Low Sum 1: {sum_1:.4f} Recorded!", icon="📉")
+                                        
+                                if sum_2 <= threshold_sum:
+                                    if st.session_state["min_sum_2"] == 1.0 or sum_2 < (st.session_state["min_sum_2"] - threshold_drop):
+                                        save_arb_opportunity(btc_slug, eth_slug, "BTC_Down_ETH_Up", sum_2, btc_down_ask, eth_up_ask)
+                                        st.session_state["min_sum_2"] = sum_2
+                                        st.toast(f"New Low Sum 2: {sum_2:.4f} Recorded!", icon="📉")
+                                    
+                        except ValueError:
+                            pass # Data loading
+                            
+                        st.caption(f"Last Update: {time.strftime('%H:%M:%S')}")
 
-                time.sleep(0.5)
+                time.sleep(0.01) # Ultra-fast polling for responsiveness
                 
                 # Check rollover every 10s
-                if int(time.time()) % 10 == 0:
-                    break
+                # Use a counter or time check to break loop occasionally to allow Streamlit to handle other events if needed
+                # But actually, st.empty() loop is blocking.
+                # If we want to stay "live", we should loop indefinitely until user input changes (which triggers rerun).
+                # The `if int(time.time()) % 10 == 0: break` was causing 10s reload cycles.
+                # We should remove the break to keep it smooth, OR keep it but rely on st.rerun().
+                # If "Monitor not timely", it might be because the loop breaks too often or not often enough to refresh UI context.
+                # Let's try REMOVING the break to stay in the loop longer, 
+                # but we need a way to detect tab change.
+                # Streamlit script runs top to bottom. If we are in this while loop, we are blocking.
+                # We should use st.empty() and just loop.
+                
+                # To make it responsive to sidebar changes, we might need to break occasionally.
+                # But 10s is fine. Maybe the "not timely" meant the WebSocket wasn't pushing updates?
+                # I added the ws_manager.start() check above.
+                
+                # Let's reduce the break frequency or remove it if possible, 
+                # but we need to check if slugs changed (Auto-rollover).
+                
+                if int(time.time()) % 5 == 0:
+                     # Check if we need to rollover without full rerun if possible, 
+                     # or just break to let the outer loop handle rollover logic.
+                     break
             
             st.rerun()
 
@@ -529,9 +658,27 @@ elif page == "Arb History":
     st.title("Arbitrage Opportunities History 📉")
     
     with st.expander("Arbitrage Recording Settings"):
-        st.slider("Recording Threshold (Sum)", 0.01, 1.0, 0.8, key="arb_sum_threshold")
-        st.slider("New Low Drop Threshold", 0.01, 0.2, 0.03, key="arb_drop_threshold")
-        st.number_input("Stop Recording Minutes Before Close", min_value=0, max_value=14, value=5, key="arb_time_threshold")
+        st.slider(
+            "Recording Threshold (Sum)", 
+            0.01, 1.0, 
+            value=st.session_state["arb_sum_threshold"], 
+            key="arb_sum_threshold_slider", 
+            on_change=lambda: st.session_state.update({"arb_sum_threshold": st.session_state.arb_sum_threshold_slider}) or save_settings()
+        )
+        st.slider(
+            "New Low Drop Threshold", 
+            0.01, 0.2, 
+            value=st.session_state["arb_drop_threshold"], 
+            key="arb_drop_threshold_slider", 
+            on_change=lambda: st.session_state.update({"arb_drop_threshold": st.session_state.arb_drop_threshold_slider}) or save_settings()
+        )
+        st.number_input(
+            "Stop Recording Minutes Before Close", 
+            min_value=0, max_value=14, 
+            value=st.session_state["arb_time_threshold"], 
+            key="arb_time_threshold_input", 
+            on_change=lambda: st.session_state.update({"arb_time_threshold": st.session_state.arb_time_threshold_input}) or save_settings()
+        )
 
     if os.path.exists(ARB_OPPORTUNITY_FILE):
         try:
@@ -582,203 +729,214 @@ elif page == "Arb History":
     else:
         st.info("No arbitrage history recorded yet.")
 
-# --- PAGE: Market Results History ---
-elif page == "Market Results History":
-    st.title("Market Results History 📊")
-    st.caption("Fetching last 100 historical rounds from chain... ✅ = Arbitrage Valid (Same Result)")
+# Helper to fetch rounds data (moved out for reusability)
+def fetch_rounds_data(ts_list):
+    from concurrent.futures import ThreadPoolExecutor
     
-    # Generate list of past 100 rounds (15m intervals)
-    # Start from current 15m block (or previous one if current is not done)
-    # Actually, we want COMPLETED rounds. So start from (now // 900) * 900 - 900.
+    results = []
     
-    now = int(time.time())
-    current_block_start = (now // 900) * 900
-    
-    # Generate last 100 timestamps (descending)
-    timestamps = []
-    for i in range(1, 101):
-        timestamps.append(current_block_start - (i * 900))
+    def process_round(ts):
+        btc_slug = f"btc-updown-15m-{ts}"
+        eth_slug = f"eth-updown-15m-{ts}"
         
-    # Helper to construct slugs
-    # Pattern: btc-updown-15m-{timestamp}
-    # Note: timestamp in slug is START time.
-    
-    @st.cache_data(ttl=3600) # Cache for 1 hour since history doesn't change
-    def fetch_historical_results(ts_list):
-        from concurrent.futures import ThreadPoolExecutor
+        btc_res = get_market_winner(btc_slug)
+        eth_res = get_market_winner(eth_slug)
         
-        results = []
+        is_arb = "❌"
+        if btc_res not in ["Pending", "Pending (Closed)", "Active", "Error", "Not Found"] and \
+           btc_res == eth_res:
+            is_arb = "✅"
+        elif btc_res in ["Pending", "Pending (Closed)", "Active"] or eth_res in ["Pending", "Pending (Closed)", "Active"]:
+            is_arb = "⏳"
+        elif btc_res == "Error" or eth_res == "Error":
+            is_arb = "⚠️"
         
-        def process_round(ts):
-            btc_slug = f"btc-updown-15m-{ts}"
-            eth_slug = f"eth-updown-15m-{ts}"
-            
-            # Fetch winners
-            # Reuse get_market_winner logic but make it standalone or passed in?
-            # We need to define it here or outside.
-            
-            def get_winner(slug):
-                try:
-                    url = f"{GAMMA_API_URL}/events"
-                    params = {"slug": slug}
-                    resp = requests.get(url, params=params, verify=False, timeout=5)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        if data and isinstance(data, list) and len(data) > 0:
-                            markets = data[0].get("markets", [])
-                            if markets:
-                                m = markets[0]
-                                
-                                # Method 1: Check outcomePrices (Reliable for resolved markets)
-                                # e.g. outcomePrices: ["0", "1"] means outcomes[1] won
-                                prices = m.get("outcomePrices")
-                                outcomes = parse_json_field(m.get("outcomes"))
-                                
-                                # Need to handle string json parsing if outcomes is string
-                                if isinstance(outcomes, str):
-                                    try: outcomes = json.loads(outcomes)
-                                    except: pass
-                                    
-                                if isinstance(prices, str):
-                                    try: prices = json.loads(prices)
-                                    except: pass
-                                
-                                if prices and outcomes and len(prices) == len(outcomes):
-                                    # Find index where price is "1"
-                                    for i, p in enumerate(prices):
-                                        try:
-                                            # Debugging showed prices are strings like "1", "0"
-                                            if float(p) >= 0.99: 
-                                                return outcomes[i]
-                                        except:
-                                            pass
-                                
-                                # Method 2: Check market details (tokens winner) - Fallback
-                                mid = m.get("id")
-                                if mid:
-                                    m_url = f"{GAMMA_API_URL}/markets/{mid}"
-                                    m_resp = requests.get(m_url, verify=False, timeout=5)
-                                    if m_resp.status_code == 200:
-                                        m_data = m_resp.json()
-                                        if "tokens" in m_data:
-                                            for t in m_data["tokens"]:
-                                                if t.get("winner") == True:
-                                                    return t.get("outcome", "Unknown")
-                                
-                                # Check if it's just not resolved yet
-                                if m.get("closed"):
-                                    return "Pending (Closed)"
-                                else:
-                                    return "Active"
-                                    
-                        else:
-                            return "Not Found"
-                except:
-                    pass
-                return "Error"
+        return {
+            "Time": datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S'),
+            "BTC Result": btc_res,
+            "ETH Result": eth_res,
+            "Arb Valid?": is_arb,
+            "BTC Slug": btc_slug,
+            "ETH Slug": eth_slug,
+            "timestamp": ts # Keep for joining
+        }
 
-            btc_res = get_winner(btc_slug)
-            eth_res = get_winner(eth_slug)
-            
-            is_arb = "❌"
-            if btc_res not in ["Pending", "Pending (Closed)", "Active", "Error", "Not Found"] and \
-               btc_res == eth_res:
-                is_arb = "✅"
-            elif btc_res in ["Pending", "Pending (Closed)", "Active"] or eth_res in ["Pending", "Pending (Closed)", "Active"]:
-                is_arb = "⏳"
-            elif btc_res == "Error" or eth_res == "Error":
-                is_arb = "⚠️"
-            
-            # Find best arb opportunity for this round from history file
-            best_arb_info = {"Best Sum": "N/A", "Type": "N/A", "Arb Time": "N/A"}
-            
-            # We need to read the ARB_OPPORTUNITY_FILE efficiently. 
-            # Reading it inside every thread is bad. 
-            # We should pass the dataframe to this function or use a global look up.
-            # But ThreadPoolExecutor makes sharing complex objects tricky if not careful.
-            # However, 'df_arb_all' is defined outside in the main scope of this page block.
-            # We can try to access it if we fetch it before calling this.
-            
-            return {
-                "Time": datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S'),
-                "BTC Result": btc_res,
-                "ETH Result": eth_res,
-                "Arb Valid?": is_arb,
-                "BTC Slug": btc_slug,
-                "ETH Slug": eth_slug,
-                "timestamp": ts # Keep for joining
-            }
+    # Pre-load Arb History for lookup
+    df_arb_all = pd.DataFrame()
+    if os.path.exists(ARB_OPPORTUNITY_FILE):
+        try:
+            df_arb_all = pd.read_csv(ARB_OPPORTUNITY_FILE)
+        except: pass
 
-        # Pre-load Arb History for lookup
-        df_arb_all = pd.DataFrame()
-        if os.path.exists(ARB_OPPORTUNITY_FILE):
-            try:
-                df_arb_all = pd.read_csv(ARB_OPPORTUNITY_FILE)
-            except: pass
-
-        # Fetch in parallel
-        with ThreadPoolExecutor(max_workers=20) as executor:
-            results = list(executor.map(process_round, ts_list))
-            
-        # Post-process results to add Arb Info
-        final_results = []
+    # Fetch in parallel
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        results = list(executor.map(process_round, ts_list))
         
-        # Get settings from session state (or defaults) to apply filtering
-        threshold_sum = st.session_state.get("arb_sum_threshold", 0.8)
-        threshold_time_mins = st.session_state.get("arb_time_threshold", 5)
+    # Post-process results to add Arb Info
+    final_results = []
+    
+    # Get settings from session state (or defaults) to apply filtering
+    # Note: accessed from session_state in main thread context usually works, 
+    # but here we are in a function called by main thread.
+    threshold_sum = st.session_state.get("arb_sum_threshold", 0.8)
+    threshold_time_mins = st.session_state.get("arb_time_threshold", 5)
+    
+    for r in results:
+        ts = r["timestamp"]
+        btc_slug = r["BTC Slug"]
         
-        for r in results:
-            ts = r["timestamp"]
-            btc_slug = r["BTC Slug"]
+        best_sum = None
+        best_type = ""
+        best_time_str = ""
+        
+        if not df_arb_all.empty and "btc_slug" in df_arb_all.columns:
+            # Filter for this round
+            round_arbs = df_arb_all[df_arb_all["btc_slug"] == btc_slug]
             
-            best_sum = None
-            best_type = ""
-            best_time_str = ""
-            
-            if not df_arb_all.empty and "btc_slug" in df_arb_all.columns:
-                # Filter for this round
-                round_arbs = df_arb_all[df_arb_all["btc_slug"] == btc_slug]
+            if not round_arbs.empty:
+                # Apply filters: Sum <= threshold
+                round_arbs = round_arbs[round_arbs["sum"] <= threshold_sum]
+                
+                # Apply time filter: End time - record time > threshold
+                # End time is ts + 900
+                end_time = ts + 900
+                # round_arbs["timestamp"] is record time
+                # We want: (end_time - record_time) >= (threshold_time_mins * 60)
+                # => record_time <= end_time - (threshold_time_mins * 60)
+                cutoff_time = end_time - (threshold_time_mins * 60)
+                round_arbs = round_arbs[round_arbs["timestamp"] <= cutoff_time]
                 
                 if not round_arbs.empty:
-                    # Apply filters: Sum <= threshold
-                    round_arbs = round_arbs[round_arbs["sum"] <= threshold_sum]
-                    
-                    # Apply time filter: End time - record time > threshold
-                    # End time is ts + 900
-                    end_time = ts + 900
-                    # round_arbs["timestamp"] is record time
-                    # We want: (end_time - record_time) >= (threshold_time_mins * 60)
-                    # => record_time <= end_time - (threshold_time_mins * 60)
-                    cutoff_time = end_time - (threshold_time_mins * 60)
-                    round_arbs = round_arbs[round_arbs["timestamp"] <= cutoff_time]
-                    
-                    if not round_arbs.empty:
-                        # Find min sum
-                        min_row = round_arbs.loc[round_arbs["sum"].idxmin()]
-                        best_sum = min_row["sum"]
-                        best_type = min_row["type"]
-                        best_time_str = datetime.datetime.fromtimestamp(min_row["timestamp"]).strftime('%H:%M:%S')
+                    # Find min sum
+                    min_row = round_arbs.loc[round_arbs["sum"].idxmin()]
+                    best_sum = min_row["sum"]
+                    best_type = min_row["type"]
+                    best_time_str = datetime.datetime.fromtimestamp(min_row["timestamp"]).strftime('%H:%M:%S')
 
-            r["Best Sum"] = f"{best_sum:.4f}" if best_sum is not None else "-"
-            r["Arb Type"] = best_type if best_type else "-"
-            r["Arb Time"] = best_time_str if best_time_str else "-"
-            
-            del r["timestamp"] # Remove raw timestamp
-            final_results.append(r)
-            
-        return final_results
-
-    # Fetch
-    with st.spinner("Loading historical data..."):
-        data = fetch_historical_results(timestamps)
+        r["Best Sum"] = f"{best_sum:.4f}" if best_sum is not None else "-"
+        r["Arb Type"] = best_type if best_type else "-"
+        r["Arb Time"] = best_time_str if best_time_str else "-"
         
-    if data:
-        df_res = pd.DataFrame(data)
-        st.dataframe(df_res, use_container_width=True)
+        # Keep timestamp for merging logic
+        final_results.append(r)
+
+    return final_results
+
+
+# --- PAGE: Market Results History ---
+if page == "Market Results History":
+    st.title("Market Results History 📊")
+    st.caption("Auto-refreshing new rounds every 10s... ✅ = Arbitrage Valid (Same Result)")
+    
+    # Initialize history in session state
+    if "market_history_data" not in st.session_state:
+        # Load local history file if exists to avoid refetching everything
+        # But we don't have a local full history file structure yet, only legacy btc_15m_history.csv
+        # So we stick to fetching from chain, but we only do it ONCE per session.
+        # Problem: "Every time enter page re-init" -> because st.session_state persists, this block *should* be skipped.
+        # UNLESS the user refreshes the browser tab (F5).
+        # If user switches tabs in sidebar, session_state is kept.
+        # If user refreshes browser, session_state is lost.
+        # To persist across browser refreshes, we need to save to disk.
+        
+        # Let's try to load from a local JSON cache file if available
+        MARKET_HISTORY_CACHE = "market_history_cache.json"
+        loaded_from_cache = False
+        
+        if os.path.exists(MARKET_HISTORY_CACHE):
+            try:
+                with open(MARKET_HISTORY_CACHE, "r") as f:
+                    cached_data = json.load(f)
+                    if cached_data:
+                        st.session_state["market_history_data"] = cached_data
+                        loaded_from_cache = True
+            except: pass
+            
+        if not loaded_from_cache:
+            # Initial Fetch: Last 100
+            now = int(time.time())
+            current_block_start = (now // 900) * 900
+            timestamps = [current_block_start - (i * 900) for i in range(100)]
+            
+            with st.spinner("Initializing historical data (last 100 rounds)..."):
+                data = fetch_rounds_data(timestamps)
+                st.session_state["market_history_data"] = data
+
+    # Display current data
+    current_history = st.session_state["market_history_data"]
+    df_res = pd.DataFrame(current_history)
+    
+    # Drop timestamp col for display but keep in state
+    if not df_res.empty:
+        df_display = df_res.drop(columns=["timestamp"]).copy()
+        # Ensure sorting by Time (descending) roughly
+        # Actually Time string sorting works YYYY-MM-DD
+        df_display = df_display.sort_values(by="Time", ascending=False)
+        st.dataframe(df_display, use_container_width=True)
         
         # Calculate stats
         valid_count = df_res[df_res["Arb Valid?"] == "✅"].shape[0]
         total = len(df_res)
-        st.metric("Arbitrage Success Rate (Last 100)", f"{valid_count}/{total}", f"{(valid_count/total)*100:.1f}%")
+        st.metric("Arbitrage Success Rate (All Loaded)", f"{valid_count}/{total}", f"{(valid_count/total)*100:.1f}%")
     else:
-        st.error("Failed to fetch data.")
+        st.info("No data yet.")
+        
+    # Auto-refresh loop
+    time.sleep(10)
+    
+    # Update Logic
+    # 1. Identify max timestamp currently loaded
+    max_ts = 0
+    if current_history:
+        max_ts = max(item["timestamp"] for item in current_history)
+    else:
+        max_ts = (int(time.time()) // 900) * 900 - 900
+        
+    now = int(time.time())
+    current_block_start = (now // 900) * 900
+    
+    # 2. Find new timestamps (from max_ts + 900 up to current)
+    timestamps_to_update = []
+    t = max_ts + 900
+    while t <= current_block_start:
+        timestamps_to_update.append(t)
+        t += 900
+        
+    # 3. Find pending rounds that need status refresh
+    # Statuses that imply "not finished": "Pending", "Active", "Pending (Closed)"
+    pending_ts = [
+        item["timestamp"] for item in current_history 
+        if item["BTC Result"] in ["Pending", "Pending (Closed)", "Active", "Error", "Not Found"] 
+        or item["ETH Result"] in ["Pending", "Pending (Closed)", "Active", "Error", "Not Found"]
+    ]
+    
+    # Combine unique timestamps
+    all_ts_to_fetch = list(set(timestamps_to_update + pending_ts))
+    
+    if all_ts_to_fetch:
+        # Fetch updates
+        # st.toast(f"Updating {len(all_ts_to_fetch)} rounds...", icon="🔄")
+        updated_items = fetch_rounds_data(all_ts_to_fetch)
+        
+        # Merge into session state
+        # Use a dict for O(1) update
+        history_map = {item["timestamp"]: item for item in st.session_state["market_history_data"]}
+        
+        for item in updated_items:
+            history_map[item["timestamp"]] = item
+            
+        # Convert back to list and sort
+        new_history_list = list(history_map.values())
+        # Sort descending by timestamp
+        new_history_list.sort(key=lambda x: x["timestamp"], reverse=True)
+        
+        st.session_state["market_history_data"] = new_history_list
+        
+        # Save to local cache
+        MARKET_HISTORY_CACHE = "market_history_cache.json"
+        try:
+            with open(MARKET_HISTORY_CACHE, "w") as f:
+                json.dump(new_history_list, f)
+        except: pass
+        
+    st.rerun()
