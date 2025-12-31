@@ -12,10 +12,10 @@ def get_slug(ts):
 now = int(time.time())
 # Round down to 15m
 current_block_start = (now // 900) * 900
-# Go back 8 rounds (2 hours)
-target_ts = current_block_start - (8 * 900)
-
-slug = get_slug(target_ts)
+slug = "eth-updown-15m-1767148200" # Based on image: 9:30PM ET start time = 21:30 ET
+# 21:30 ET is likely around 1767148200 if 9:00AM was 1767103200 (diff 12.5h = 45000s)
+# 1767103200 + 45000 = 1767148200.
+# Let's try to fetch this specific market that is RESOLVED in the screenshot.
 print(f"Fetching slug: {slug}")
 
 url = "https://gamma-api.polymarket.com/events"
