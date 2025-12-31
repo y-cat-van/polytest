@@ -39,6 +39,7 @@ try:
             print(f"Outcomes: {market.get('outcomes')}")
             print(f"Outcome Prices: {market.get('outcomePrices')}")
             print(f"UMA Resolution Status: {market.get('umaResolutionStatus')}")
+            print(f"Token IDs: {market.get('clobTokenIds')}")
             
             # Now fetch the specific market details which might have more info
             m_id = market.get("id")

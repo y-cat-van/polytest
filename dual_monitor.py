@@ -274,6 +274,16 @@ if page == "Monitor":
         eth_seed_slug = st.text_input("ETH Seed Slug:", value="eth-updown-15m-1767105900")
         auto_mode = st.toggle("Enable Auto-Rollover & Recording", value=True)
         
+        with st.expander("Arbitrage Recording Settings"):
+            # These sliders are now also present in "Arb History" page for user convenience.
+            # But Streamlit widgets with same key must be unique.
+            # So if we are on Monitor page, we show them. If on Arb History, we show them there.
+            # Or we can just remove them from here if the user prefers them in Arb History.
+            # User said: "Move this setting to Arb History page".
+            # So we REMOVE them from here (Monitor Page Sidebar).
+            pass # Removed per user request
+            st.info("Settings moved to 'Arb History' page.")
+
         if st.button("Clear History"):
             if os.path.exists(HISTORY_FILE): os.remove(HISTORY_FILE)
             if os.path.exists(ARB_OPPORTUNITY_FILE): os.remove(ARB_OPPORTUNITY_FILE)
@@ -429,17 +439,57 @@ if page == "Monitor":
                         st.write(f"**BTC Down + ETH Up (Ask Sum): {sum_2:.4f}**")
                         
                         # Record Logic
-                        if sum_1 <= 0.8:
-                            if sum_1 < st.session_state["min_sum_1"]:
-                                save_arb_opportunity(btc_slug, eth_slug, "BTC_Up_ETH_Down", sum_1, btc_up_ask, eth_down_ask)
-                                st.session_state["min_sum_1"] = sum_1
-                                st.toast(f"New Low Sum 1: {sum_1:.4f} Recorded!", icon="📉")
+                        # Use session state settings if available (defaults to 0.8 / 0.03 if not set in UI yet)
+                        threshold_sum = st.session_state.get("arb_sum_threshold", 0.8)
+                        threshold_drop = st.session_state.get("arb_drop_threshold", 0.03)
+                        threshold_time_mins = st.session_state.get("arb_time_threshold", 5)
+
+                        # Check time constraint
+                        # We need to know when the round ends.
+                        # BTC and ETH usually end at same time for these pairs.
+                        # Let's assume 15m intervals ending at X:00, X:15, X:30, X:45
+                        # Or parse from btc_markets if available
+                        should_record_time = True
+                        try:
+                            # Try to get end time from API data first
+                            end_ts = 0
+                            if btc_markets and len(btc_markets) > 0:
+                                end_date_iso = btc_markets[0].get("endDate")
+                                if end_date_iso:
+                                    end_dt = datetime.datetime.fromisoformat(end_date_iso.replace("Z", "+00:00"))
+                                    end_ts = end_dt.timestamp()
+                            
+                            # Fallback to slug parsing
+                            if end_ts == 0:
+                                parts = btc_slug.split("-")
+                                end_ts = int(parts[-1])
+                            
+                            now_ts = time.time()
+                            seconds_left = end_ts - now_ts
+                            
+                            if seconds_left < (threshold_time_mins * 60):
+                                should_record_time = False
+                        except:
+                            pass # If error, default to True to not miss data
+
+                        if should_record_time:
+                            if sum_1 <= threshold_sum:
+                                # Logic: Only record if significantly lower than previous minimum
+                                # or if no minimum recorded yet (initially 1.0)
                                 
-                        if sum_2 <= 0.8:
-                            if sum_2 < st.session_state["min_sum_2"]:
-                                save_arb_opportunity(btc_slug, eth_slug, "BTC_Down_ETH_Up", sum_2, btc_down_ask, eth_up_ask)
-                                st.session_state["min_sum_2"] = sum_2
-                                st.toast(f"New Low Sum 2: {sum_2:.4f} Recorded!", icon="📉")
+                                # Current logic: if sum_1 < min_sum_1
+                                # New logic: if sum_1 < (min_sum_1 - threshold_drop) OR (min_sum_1 == 1.0)
+                                
+                                if st.session_state["min_sum_1"] == 1.0 or sum_1 < (st.session_state["min_sum_1"] - threshold_drop):
+                                    save_arb_opportunity(btc_slug, eth_slug, "BTC_Up_ETH_Down", sum_1, btc_up_ask, eth_down_ask)
+                                    st.session_state["min_sum_1"] = sum_1
+                                    st.toast(f"New Low Sum 1: {sum_1:.4f} Recorded!", icon="📉")
+                                    
+                            if sum_2 <= threshold_sum:
+                                if st.session_state["min_sum_2"] == 1.0 or sum_2 < (st.session_state["min_sum_2"] - threshold_drop):
+                                    save_arb_opportunity(btc_slug, eth_slug, "BTC_Down_ETH_Up", sum_2, btc_down_ask, eth_up_ask)
+                                    st.session_state["min_sum_2"] = sum_2
+                                    st.toast(f"New Low Sum 2: {sum_2:.4f} Recorded!", icon="📉")
                                 
                     except ValueError:
                         pass # Data loading
@@ -477,13 +527,54 @@ if page == "Monitor":
 # --- PAGE: Arb History ---
 elif page == "Arb History":
     st.title("Arbitrage Opportunities History 📉")
+    
+    with st.expander("Arbitrage Recording Settings"):
+        st.slider("Recording Threshold (Sum)", 0.01, 1.0, 0.8, key="arb_sum_threshold")
+        st.slider("New Low Drop Threshold", 0.01, 0.2, 0.03, key="arb_drop_threshold")
+        st.number_input("Stop Recording Minutes Before Close", min_value=0, max_value=14, value=5, key="arb_time_threshold")
+
     if os.path.exists(ARB_OPPORTUNITY_FILE):
         try:
             df_arb = pd.read_csv(ARB_OPPORTUNITY_FILE)
             if not df_arb.empty and "timestamp" in df_arb.columns:
-                df_arb["time_str"] = pd.to_datetime(df_arb["timestamp"], unit="s").dt.strftime('%Y-%m-%d %H:%M:%S')
-                df_arb = df_arb.sort_values(by="timestamp", ascending=False)
-                st.dataframe(df_arb, use_container_width=True)
+                # Deduplicate
+                df_arb = df_arb.drop_duplicates(subset=["timestamp", "type", "sum"])
+                
+                # Format time
+                df_arb["Time"] = pd.to_datetime(df_arb["timestamp"], unit="s").dt.strftime('%Y-%m-%d %H:%M:%S')
+                
+                # Sort
+                df_arb = df_arb.sort_values(by="Time", ascending=False)
+
+                # Reorder columns
+                cols = ["Time", "type", "sum", "btc_ask", "eth_ask", "btc_slug", "eth_slug"]
+                df_arb = df_arb[cols]
+                
+                # Define a function to style rows based on Slug
+                def highlight_slug_groups(row):
+                    # Use the BTC slug as a unique identifier for the "round"
+                    # We can hash the slug string to get a color hue?
+                    # Or simpler: alternating colors based on group?
+                    # Streamlit st.dataframe styling is limited for whole-row coloring based on value easily without complex logic.
+                    # But we can try to color specific cells or use 'background-color' property.
+                    
+                    # Simple approach: Hash the btc_slug to a hex color (light pastel)
+                    slug = row["btc_slug"]
+                    hash_val = hash(slug)
+                    # Generate a pastel color
+                    r = (hash_val & 0xFF0000) >> 16
+                    g = (hash_val & 0x00FF00) >> 8
+                    b = (hash_val & 0x0000FF)
+                    
+                    # Ensure light/pastel for readability
+                    r = (r + 255) // 2
+                    g = (g + 255) // 2
+                    b = (b + 255) // 2
+                    
+                    color = f"#{r:02x}{g:02x}{b:02x}"
+                    return [f'background-color: {color}' for _ in row]
+
+                st.dataframe(df_arb.style.apply(highlight_slug_groups, axis=1), use_container_width=True)
             else:
                 st.write("No valid data found.")
         except Exception as e:
@@ -543,11 +634,21 @@ elif page == "Market Results History":
                                 prices = m.get("outcomePrices")
                                 outcomes = parse_json_field(m.get("outcomes"))
                                 
+                                # Need to handle string json parsing if outcomes is string
+                                if isinstance(outcomes, str):
+                                    try: outcomes = json.loads(outcomes)
+                                    except: pass
+                                    
+                                if isinstance(prices, str):
+                                    try: prices = json.loads(prices)
+                                    except: pass
+                                
                                 if prices and outcomes and len(prices) == len(outcomes):
                                     # Find index where price is "1"
                                     for i, p in enumerate(prices):
                                         try:
-                                            if float(p) >= 0.99: # Allow slight float diff, though usually "1"
+                                            # Debugging showed prices are strings like "1", "0"
+                                            if float(p) >= 0.99: 
                                                 return outcomes[i]
                                         except:
                                             pass
@@ -587,21 +688,85 @@ elif page == "Market Results History":
                 is_arb = "⏳"
             elif btc_res == "Error" or eth_res == "Error":
                 is_arb = "⚠️"
-                
+            
+            # Find best arb opportunity for this round from history file
+            best_arb_info = {"Best Sum": "N/A", "Type": "N/A", "Arb Time": "N/A"}
+            
+            # We need to read the ARB_OPPORTUNITY_FILE efficiently. 
+            # Reading it inside every thread is bad. 
+            # We should pass the dataframe to this function or use a global look up.
+            # But ThreadPoolExecutor makes sharing complex objects tricky if not careful.
+            # However, 'df_arb_all' is defined outside in the main scope of this page block.
+            # We can try to access it if we fetch it before calling this.
+            
             return {
                 "Time": datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S'),
                 "BTC Result": btc_res,
                 "ETH Result": eth_res,
                 "Arb Valid?": is_arb,
                 "BTC Slug": btc_slug,
-                "ETH Slug": eth_slug
+                "ETH Slug": eth_slug,
+                "timestamp": ts # Keep for joining
             }
+
+        # Pre-load Arb History for lookup
+        df_arb_all = pd.DataFrame()
+        if os.path.exists(ARB_OPPORTUNITY_FILE):
+            try:
+                df_arb_all = pd.read_csv(ARB_OPPORTUNITY_FILE)
+            except: pass
 
         # Fetch in parallel
         with ThreadPoolExecutor(max_workers=20) as executor:
             results = list(executor.map(process_round, ts_list))
             
-        return results
+        # Post-process results to add Arb Info
+        final_results = []
+        
+        # Get settings from session state (or defaults) to apply filtering
+        threshold_sum = st.session_state.get("arb_sum_threshold", 0.8)
+        threshold_time_mins = st.session_state.get("arb_time_threshold", 5)
+        
+        for r in results:
+            ts = r["timestamp"]
+            btc_slug = r["BTC Slug"]
+            
+            best_sum = None
+            best_type = ""
+            best_time_str = ""
+            
+            if not df_arb_all.empty and "btc_slug" in df_arb_all.columns:
+                # Filter for this round
+                round_arbs = df_arb_all[df_arb_all["btc_slug"] == btc_slug]
+                
+                if not round_arbs.empty:
+                    # Apply filters: Sum <= threshold
+                    round_arbs = round_arbs[round_arbs["sum"] <= threshold_sum]
+                    
+                    # Apply time filter: End time - record time > threshold
+                    # End time is ts + 900
+                    end_time = ts + 900
+                    # round_arbs["timestamp"] is record time
+                    # We want: (end_time - record_time) >= (threshold_time_mins * 60)
+                    # => record_time <= end_time - (threshold_time_mins * 60)
+                    cutoff_time = end_time - (threshold_time_mins * 60)
+                    round_arbs = round_arbs[round_arbs["timestamp"] <= cutoff_time]
+                    
+                    if not round_arbs.empty:
+                        # Find min sum
+                        min_row = round_arbs.loc[round_arbs["sum"].idxmin()]
+                        best_sum = min_row["sum"]
+                        best_type = min_row["type"]
+                        best_time_str = datetime.datetime.fromtimestamp(min_row["timestamp"]).strftime('%H:%M:%S')
+
+            r["Best Sum"] = f"{best_sum:.4f}" if best_sum is not None else "-"
+            r["Arb Type"] = best_type if best_type else "-"
+            r["Arb Time"] = best_time_str if best_time_str else "-"
+            
+            del r["timestamp"] # Remove raw timestamp
+            final_results.append(r)
+            
+        return final_results
 
     # Fetch
     with st.spinner("Loading historical data..."):
