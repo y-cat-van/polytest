@@ -25,7 +25,10 @@ def save_settings():
     settings = {
         "arb_sum_threshold": st.session_state.get("arb_sum_threshold", 0.8),
         "arb_drop_threshold": st.session_state.get("arb_drop_threshold", 0.03),
-        "arb_time_threshold": st.session_state.get("arb_time_threshold", 5)
+        "arb_time_threshold": st.session_state.get("arb_time_threshold", 5),
+        "same_sum_threshold": st.session_state.get("same_sum_threshold", 0.8),
+        "same_drop_threshold": st.session_state.get("same_drop_threshold", 0.03),
+        "same_time_threshold": st.session_state.get("same_time_threshold", 5)
     }
     with open(SETTINGS_FILE, "w") as f:
         json.dump(settings, f)
@@ -249,7 +252,9 @@ class PolymarketWSManager:
                         ba = change.get("best_ask")
                         self._update_price_direct(asset_id, bb, ba)
         except Exception as e:
-            print(f"Msg Parse Error: {e}")
+            # Silence expected heartbeat/non-json errors or print truncated
+            if "Expecting value" not in str(e):
+                print(f"Msg Parse Error: {e} | Msg: {message[:100]}")
 
     def _on_error(self, ws, error):
         print(f"WS Error: {error}")
@@ -267,7 +272,8 @@ class PolymarketWSManager:
                     self._subscribe(list(self.subscribed_tokens))
 
     def _subscribe(self, token_ids):
-        msg = {"assets_ids": token_ids, "type": "market"}
+        # Try both keys just in case, though asset_ids is standard
+        msg = {"asset_ids": token_ids, "type": "market"}
         if self.ws and self.ws.sock and self.ws.sock.connected:
             try:
                 self.ws.send(json.dumps(msg))
@@ -334,7 +340,7 @@ if not ws_manager.is_running:
     ws_manager.start()
 
 # --- Navigation ---
-page = st.sidebar.radio("Navigation", ["Monitor", "Arb History", "Market Results History"])
+page = st.sidebar.radio("Navigation", ["Monitor", "Arb History", "同向套利", "异向套利"])
 
 # Load settings on startup (moved after page config)
 loaded_settings = load_settings()
@@ -345,6 +351,12 @@ if "arb_drop_threshold" not in st.session_state:
     st.session_state["arb_drop_threshold"] = loaded_settings.get("arb_drop_threshold", 0.03)
 if "arb_time_threshold" not in st.session_state:
     st.session_state["arb_time_threshold"] = loaded_settings.get("arb_time_threshold", 5)
+if "same_sum_threshold" not in st.session_state:
+    st.session_state["same_sum_threshold"] = loaded_settings.get("same_sum_threshold", 0.8)
+if "same_drop_threshold" not in st.session_state:
+    st.session_state["same_drop_threshold"] = loaded_settings.get("same_drop_threshold", 0.03)
+if "same_time_threshold" not in st.session_state:
+    st.session_state["same_time_threshold"] = loaded_settings.get("same_time_threshold", 5)
 
 # --- Helper Functions ---
 def get_latest_active_slug(prefix):
@@ -392,6 +404,15 @@ if page == "Monitor":
             if os.path.exists(ARB_OPPORTUNITY_FILE): os.remove(ARB_OPPORTUNITY_FILE)
             if os.path.exists(ROUND_HISTORY_FILE): os.remove(ROUND_HISTORY_FILE)
             st.success("History cleared!")
+            
+        with st.expander("Debug Info"):
+            st.write(f"WS Connected: {ws_manager.ws.sock.connected if ws_manager.ws and ws_manager.ws.sock else 'False'}")
+            st.write(f"Subscribed Count: {len(ws_manager.subscribed_tokens)}")
+            st.write(f"Last Update: {ws_manager.last_update}")
+            if "current_btc_slug" in st.session_state:
+                st.caption(f"BTC: {st.session_state['current_btc_slug']}")
+            if "current_eth_slug" in st.session_state:
+                st.caption(f"ETH: {st.session_state['current_eth_slug']}")
 
     # State Management
     if "current_btc_slug" not in st.session_state:
@@ -403,6 +424,9 @@ if page == "Monitor":
     # Min value tracking for Arb
     if "min_sum_1" not in st.session_state: st.session_state["min_sum_1"] = 1.0 # BTC Up + ETH Down
     if "min_sum_2" not in st.session_state: st.session_state["min_sum_2"] = 1.0 # BTC Down + ETH Up
+    # Min value tracking for Same Direction
+    if "min_same_sum_1" not in st.session_state: st.session_state["min_same_sum_1"] = 2.0 # BTC Up + ETH Up (Default higher)
+    if "min_same_sum_2" not in st.session_state: st.session_state["min_same_sum_2"] = 2.0 # BTC Down + ETH Down
 
     # Use st.empty() for the entire main area to prevent duplication
     main_placeholder = st.empty()
@@ -462,14 +486,12 @@ if page == "Monitor":
             st.subheader("BTC Market")
             st.caption(f"Slug: {btc_slug}")
             if btc_markets: st.info(btc_markets[0].get("question"))
-            btc_price_placeholder = st.empty()
             
         # ETH Column
         with c2:
             st.subheader("ETH Market")
             st.caption(f"Slug: {eth_slug}")
             if eth_markets: st.info(eth_markets[0].get("question"))
-            eth_price_placeholder = st.empty()
             
         # Countdown & Calc Placeholders
         timer_placeholder = st.empty()
@@ -493,18 +515,6 @@ if page == "Monitor":
                 # Fetch Prices (Fast dict lookup)
                 btc_prices = {t["outcome"]: ws_manager.get_price(t["token_id"]) for t in btc_tokens}
                 eth_prices = {t["outcome"]: ws_manager.get_price(t["token_id"]) for t in eth_tokens}
-                
-                # --- Render BTC Prices ---
-                with btc_price_placeholder.container():
-                    for t in btc_tokens:
-                        p = btc_prices[t["outcome"]]
-                        st.metric(f"BTC {t['outcome']}", f"Ask: {p['ask']}", f"Bid: {p['bid']}")
-
-                # --- Render ETH Prices ---
-                with eth_price_placeholder.container():
-                    for t in eth_tokens:
-                        p = eth_prices[t["outcome"]]
-                        st.metric(f"ETH {t['outcome']}", f"Ask: {p['ask']}", f"Bid: {p['bid']}")
                 
                 # --- Render Timer ---
                 with timer_placeholder.container():
@@ -557,16 +567,25 @@ if page == "Monitor":
                         
                         sum_1 = btc_up_ask + eth_down_ask
                         sum_2 = btc_down_ask + eth_up_ask
+                        sum_same_1 = btc_up_ask + eth_up_ask
+                        sum_same_2 = btc_down_ask + eth_down_ask
                         
                         st.write(f"**BTC Up + ETH Down (Ask Sum): {sum_1:.4f}**")
                         st.write(f"**BTC Down + ETH Up (Ask Sum): {sum_2:.4f}**")
+                        st.write(f"**BTC Up + ETH Up (Same Dir): {sum_same_1:.4f}**")
+                        st.write(f"**BTC Down + ETH Down (Same Dir): {sum_same_2:.4f}**")
                         
                         # Record Logic
                         threshold_sum = st.session_state.get("arb_sum_threshold", 0.8)
                         threshold_drop = st.session_state.get("arb_drop_threshold", 0.03)
                         threshold_time_mins = st.session_state.get("arb_time_threshold", 5)
 
+                        same_threshold_sum = st.session_state.get("same_sum_threshold", 0.8)
+                        same_threshold_drop = st.session_state.get("same_drop_threshold", 0.03)
+                        same_threshold_time_mins = st.session_state.get("same_time_threshold", 5)
+
                         should_record_time = True
+                        should_record_same_time = True
                         try:
                             end_ts = 0
                             if btc_markets and len(btc_markets) > 0:
@@ -584,6 +603,10 @@ if page == "Monitor":
                             
                             if seconds_left < (threshold_time_mins * 60):
                                 should_record_time = False
+                            
+                            if seconds_left < (same_threshold_time_mins * 60):
+                                should_record_same_time = False
+
                         except:
                             pass 
 
@@ -592,13 +615,26 @@ if page == "Monitor":
                                 if st.session_state["min_sum_1"] == 1.0 or sum_1 < (st.session_state["min_sum_1"] - threshold_drop):
                                     save_arb_opportunity(btc_slug, eth_slug, "BTC_Up_ETH_Down", sum_1, btc_up_ask, eth_down_ask)
                                     st.session_state["min_sum_1"] = sum_1
-                                    st.toast(f"New Low Sum 1: {sum_1:.4f} Recorded!", icon="📉")
+                                    st.toast(f"New Low Arb 1: {sum_1:.4f} Recorded!", icon="📉")
                                     
                             if sum_2 <= threshold_sum:
                                 if st.session_state["min_sum_2"] == 1.0 or sum_2 < (st.session_state["min_sum_2"] - threshold_drop):
                                     save_arb_opportunity(btc_slug, eth_slug, "BTC_Down_ETH_Up", sum_2, btc_down_ask, eth_up_ask)
                                     st.session_state["min_sum_2"] = sum_2
-                                    st.toast(f"New Low Sum 2: {sum_2:.4f} Recorded!", icon="📉")
+                                    st.toast(f"New Low Arb 2: {sum_2:.4f} Recorded!", icon="📉")
+
+                        if should_record_same_time:
+                            if sum_same_1 <= same_threshold_sum:
+                                if st.session_state["min_same_sum_1"] == 2.0 or sum_same_1 < (st.session_state["min_same_sum_1"] - same_threshold_drop):
+                                    save_arb_opportunity(btc_slug, eth_slug, "BTC_Up_ETH_Up", sum_same_1, btc_up_ask, eth_up_ask)
+                                    st.session_state["min_same_sum_1"] = sum_same_1
+                                    st.toast(f"New Low Same 1: {sum_same_1:.4f} Recorded!", icon="📉")
+                                    
+                            if sum_same_2 <= same_threshold_sum:
+                                if st.session_state["min_same_sum_2"] == 2.0 or sum_same_2 < (st.session_state["min_same_sum_2"] - same_threshold_drop):
+                                    save_arb_opportunity(btc_slug, eth_slug, "BTC_Down_ETH_Down", sum_same_2, btc_down_ask, eth_down_ask)
+                                    st.session_state["min_same_sum_2"] = sum_same_2
+                                    st.toast(f"New Low Same 2: {sum_same_2:.4f} Recorded!", icon="📉")
                                 
                     except ValueError:
                         pass
@@ -607,7 +643,7 @@ if page == "Monitor":
                 with footer_placeholder.container():
                     st.caption(f"Last Update: {time.strftime('%H:%M:%S')}")
 
-            time.sleep(0.01) # Ultra-fast polling
+            time.sleep(0.5) # Reduced polling frequency to prevent overheating (was 0.01)
             
             # Check rollover logic
             try:
@@ -648,28 +684,59 @@ if page == "Monitor":
 elif page == "Arb History":
     st.title("Arbitrage Opportunities History 📉")
     
-    with st.expander("Arbitrage Recording Settings"):
-        st.slider(
-            "Recording Threshold (Sum)", 
-            0.01, 1.0, 
-            value=st.session_state["arb_sum_threshold"], 
-            key="arb_sum_threshold_slider", 
-            on_change=lambda: st.session_state.update({"arb_sum_threshold": st.session_state.arb_sum_threshold_slider}) or save_settings()
-        )
-        st.slider(
-            "New Low Drop Threshold", 
-            0.01, 0.2, 
-            value=st.session_state["arb_drop_threshold"], 
-            key="arb_drop_threshold_slider", 
-            on_change=lambda: st.session_state.update({"arb_drop_threshold": st.session_state.arb_drop_threshold_slider}) or save_settings()
-        )
-        st.number_input(
-            "Stop Recording Minutes Before Close", 
-            min_value=0, max_value=14, 
-            value=st.session_state["arb_time_threshold"], 
-            key="arb_time_threshold_input", 
-            on_change=lambda: st.session_state.update({"arb_time_threshold": st.session_state.arb_time_threshold_input}) or save_settings()
-        )
+    with st.expander("Recording Settings", expanded=False):
+        tab1, tab2 = st.tabs(["Opposite (Arb)", "Same Direction"])
+        
+        with tab1:
+            st.caption("Settings for BTC Up + ETH Down / BTC Down + ETH Up")
+            st.slider(
+                "Recording Threshold (Sum)", 
+                0.01, 1.0, 
+                value=st.session_state["arb_sum_threshold"], 
+                key="arb_sum_threshold_slider", 
+                on_change=lambda: st.session_state.update({"arb_sum_threshold": st.session_state.arb_sum_threshold_slider}) or save_settings()
+            )
+            st.slider(
+                "New Low Drop Threshold", 
+                0.01, 0.2, 
+                value=st.session_state["arb_drop_threshold"], 
+                key="arb_drop_threshold_slider", 
+                on_change=lambda: st.session_state.update({"arb_drop_threshold": st.session_state.arb_drop_threshold_slider}) or save_settings()
+            )
+            st.number_input(
+                "Stop Recording Minutes Before Close", 
+                min_value=0, max_value=14, 
+                value=st.session_state["arb_time_threshold"], 
+                key="arb_time_threshold_input", 
+                on_change=lambda: st.session_state.update({"arb_time_threshold": st.session_state.arb_time_threshold_input}) or save_settings()
+            )
+            
+        with tab2:
+            st.caption("Settings for BTC Up + ETH Up / BTC Down + ETH Down")
+            st.slider(
+                "Recording Threshold (Sum)", 
+                0.01, 2.0, 
+                value=st.session_state["same_sum_threshold"], 
+                key="same_sum_threshold_slider", 
+                on_change=lambda: st.session_state.update({"same_sum_threshold": st.session_state.same_sum_threshold_slider}) or save_settings()
+            )
+            st.slider(
+                "New Low Drop Threshold", 
+                0.01, 0.2, 
+                value=st.session_state["same_drop_threshold"], 
+                key="same_drop_threshold_slider", 
+                on_change=lambda: st.session_state.update({"same_drop_threshold": st.session_state.same_drop_threshold_slider}) or save_settings()
+            )
+            st.number_input(
+                "Stop Recording Minutes Before Close", 
+                min_value=0, max_value=14, 
+                value=st.session_state["same_time_threshold"], 
+                key="same_time_threshold_input", 
+                on_change=lambda: st.session_state.update({"same_time_threshold": st.session_state.same_time_threshold_input}) or save_settings()
+            )
+
+    # Filter UI
+    filter_option = st.radio("Filter Type:", ["All", "Opposite (Arb)", "Same Direction"], horizontal=True)
 
     if os.path.exists(ARB_OPPORTUNITY_FILE):
         try:
@@ -677,6 +744,12 @@ elif page == "Arb History":
             if not df_arb.empty and "timestamp" in df_arb.columns:
                 # Deduplicate
                 df_arb = df_arb.drop_duplicates(subset=["timestamp", "type", "sum"])
+                
+                # Filter Logic
+                if filter_option == "Opposite (Arb)":
+                    df_arb = df_arb[df_arb["type"].isin(["BTC_Up_ETH_Down", "BTC_Down_ETH_Up"])]
+                elif filter_option == "Same Direction":
+                    df_arb = df_arb[df_arb["type"].isin(["BTC_Up_ETH_Up", "BTC_Down_ETH_Down"])]
                 
                 # Format time
                 df_arb["Time"] = pd.to_datetime(df_arb["timestamp"], unit="s").dt.strftime('%Y-%m-%d %H:%M:%S')
@@ -733,20 +806,21 @@ def fetch_rounds_data(ts_list):
         btc_res = get_market_winner(btc_slug)
         eth_res = get_market_winner(eth_slug)
         
-        is_arb = "❌"
-        if btc_res not in ["Pending", "Pending (Closed)", "Active", "Error", "Not Found"] and \
-           btc_res == eth_res:
-            is_arb = "✅"
-        elif btc_res in ["Pending", "Pending (Closed)", "Active"] or eth_res in ["Pending", "Pending (Closed)", "Active"]:
-            is_arb = "⏳"
-        elif btc_res == "Error" or eth_res == "Error":
-            is_arb = "⚠️"
+        # Determine Relation
+        relation = "Unknown"
+        if btc_res in ["Pending", "Pending (Closed)", "Active", "Error", "Not Found"] or \
+           eth_res in ["Pending", "Pending (Closed)", "Active", "Error", "Not Found"]:
+            relation = "Pending/Error"
+        elif btc_res == eth_res:
+            relation = "Same"
+        else:
+            relation = "Opposite"
         
         return {
             "Time": datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S'),
             "BTC Result": btc_res,
             "ETH Result": eth_res,
-            "Arb Valid?": is_arb,
+            "Relation": relation,
             "BTC Slug": btc_slug,
             "ETH Slug": eth_slug,
             "timestamp": ts # Keep for joining
@@ -767,46 +841,70 @@ def fetch_rounds_data(ts_list):
     final_results = []
     
     # Get settings from session state (or defaults) to apply filtering
-    # Note: accessed from session_state in main thread context usually works, 
-    # but here we are in a function called by main thread.
     threshold_sum = st.session_state.get("arb_sum_threshold", 0.8)
     threshold_time_mins = st.session_state.get("arb_time_threshold", 5)
+    
+    # Same settings
+    same_threshold_sum = st.session_state.get("same_sum_threshold", 0.8)
+    same_threshold_time_mins = st.session_state.get("same_time_threshold", 5)
     
     for r in results:
         ts = r["timestamp"]
         btc_slug = r["BTC Slug"]
         
-        best_sum = None
-        best_type = ""
-        best_time_str = ""
+        # Init vars
+        best_arb_sum = None
+        best_arb_type = ""
+        best_arb_time = ""
+        
+        best_same_sum = None
+        best_same_type = ""
+        best_same_time = ""
         
         if not df_arb_all.empty and "btc_slug" in df_arb_all.columns:
             # Filter for this round
             round_arbs = df_arb_all[df_arb_all["btc_slug"] == btc_slug]
             
             if not round_arbs.empty:
-                # Apply filters: Sum <= threshold
-                round_arbs = round_arbs[round_arbs["sum"] <= threshold_sum]
-                
-                # Apply time filter: End time - record time > threshold
-                # End time is ts + 900
-                end_time = ts + 900
-                # round_arbs["timestamp"] is record time
-                # We want: (end_time - record_time) >= (threshold_time_mins * 60)
-                # => record_time <= end_time - (threshold_time_mins * 60)
-                cutoff_time = end_time - (threshold_time_mins * 60)
-                round_arbs = round_arbs[round_arbs["timestamp"] <= cutoff_time]
-                
-                if not round_arbs.empty:
-                    # Find min sum
-                    min_row = round_arbs.loc[round_arbs["sum"].idxmin()]
-                    best_sum = min_row["sum"]
-                    best_type = min_row["type"]
-                    best_time_str = datetime.datetime.fromtimestamp(min_row["timestamp"]).strftime('%H:%M:%S')
+                # 1. Process Opposite (Arb) Bets
+                arb_bets = round_arbs[round_arbs["type"].isin(["BTC_Up_ETH_Down", "BTC_Down_ETH_Up"])]
+                if not arb_bets.empty:
+                    # Apply filters
+                    arb_bets = arb_bets[arb_bets["sum"] <= threshold_sum]
+                    # Time filter
+                    end_time = ts + 900
+                    cutoff_time = end_time - (threshold_time_mins * 60)
+                    arb_bets = arb_bets[arb_bets["timestamp"] <= cutoff_time]
+                    
+                    if not arb_bets.empty:
+                        min_row = arb_bets.loc[arb_bets["sum"].idxmin()]
+                        best_arb_sum = min_row["sum"]
+                        best_arb_type = min_row["type"]
+                        best_arb_time = datetime.datetime.fromtimestamp(min_row["timestamp"]).strftime('%H:%M:%S')
 
-        r["Best Sum"] = f"{best_sum:.4f}" if best_sum is not None else "-"
-        r["Arb Type"] = best_type if best_type else "-"
-        r["Arb Time"] = best_time_str if best_time_str else "-"
+                # 2. Process Same Direction Bets
+                same_bets = round_arbs[round_arbs["type"].isin(["BTC_Up_ETH_Up", "BTC_Down_ETH_Down"])]
+                if not same_bets.empty:
+                    # Apply filters
+                    same_bets = same_bets[same_bets["sum"] <= same_threshold_sum]
+                    # Time filter
+                    end_time = ts + 900
+                    cutoff_time = end_time - (same_threshold_time_mins * 60)
+                    same_bets = same_bets[same_bets["timestamp"] <= cutoff_time]
+                    
+                    if not same_bets.empty:
+                        min_row = same_bets.loc[same_bets["sum"].idxmin()]
+                        best_same_sum = min_row["sum"]
+                        best_same_type = min_row["type"]
+                        best_same_time = datetime.datetime.fromtimestamp(min_row["timestamp"]).strftime('%H:%M:%S')
+
+        r["Best Arb Sum"] = f"{best_arb_sum:.4f}" if best_arb_sum is not None else "-"
+        r["Arb Type"] = best_arb_type if best_arb_type else "-"
+        r["Arb Time"] = best_arb_time if best_arb_time else "-"
+        
+        r["Best Same Sum"] = f"{best_same_sum:.4f}" if best_same_sum is not None else "-"
+        r["Same Type"] = best_same_type if best_same_type else "-"
+        r["Same Time"] = best_same_time if best_same_time else "-"
         
         # Keep timestamp for merging logic
         final_results.append(r)
@@ -814,10 +912,14 @@ def fetch_rounds_data(ts_list):
     return final_results
 
 
-# --- PAGE: Market Results History ---
-if page == "Market Results History":
-    st.title("Market Results History 📊")
-    st.caption("✅ = Arbitrage Valid (Same Result)")
+# --- PAGE: History Pages (Shared Logic) ---
+if page in ["同向套利", "异向套利"]:
+    is_same_arb_page = (page == "同向套利") # Target: Same Result. Show: Opposite Bets (Arb)
+    page_title = "同向套利 (Same Result, Arb Bets)" if is_same_arb_page else "异向套利 (Opposite Result, Same Bets)"
+    target_relation = "Same" if is_same_arb_page else "Opposite"
+    
+    st.title(f"{page_title} 📊")
+    st.caption(f"✅ = {target_relation} Result | ❌ = {'Opposite' if is_same_arb_page else 'Same'} Result")
     
     # Initialize history in session state
     if "market_history_data" not in st.session_state:
@@ -900,17 +1002,75 @@ if page == "Market Results History":
 
     # Display current data
     current_history = st.session_state.get("market_history_data", [])
-    df_res = pd.DataFrame(current_history)
     
-    # Drop timestamp col for display but keep in state
-    if not df_res.empty:
-        df_display = df_res.drop(columns=["timestamp"]).copy()
-        df_display = df_display.sort_values(by="Time", ascending=False)
-        st.dataframe(df_display, use_container_width=True)
+    if current_history:
+        # Process data for specific page view
+        processed_data = []
+        valid_count = 0
+        resolved_count = 0
         
-        # Calculate stats
-        valid_count = df_res[df_res["Arb Valid?"] == "✅"].shape[0]
-        total = len(df_res)
-        st.metric("Arbitrage Success Rate (All Loaded)", f"{valid_count}/{total}", f"{(valid_count/total)*100:.1f}%")
+        for item in current_history:
+            # Create a copy to modify for display
+            row = item.copy()
+            
+            # Re-calculate relation on the fly to handle old cache or stale data
+            btc_res = row.get("BTC Result", "Unknown")
+            eth_res = row.get("ETH Result", "Unknown")
+            relation = "Unknown"
+            
+            if btc_res in ["Pending", "Pending (Closed)", "Active", "Error", "Not Found"] or \
+               eth_res in ["Pending", "Pending (Closed)", "Active", "Error", "Not Found"]:
+                relation = "Pending/Error"
+            elif btc_res == eth_res:
+                relation = "Same"
+            else:
+                relation = "Opposite"
+            
+            # Determine Status Icon
+            status = "⚠️"
+            if relation == "Pending/Error":
+                status = "⏳"
+            elif relation == target_relation:
+                status = "✅"
+                valid_count += 1
+                resolved_count += 1
+            else:
+                status = "❌"
+                resolved_count += 1
+            
+            row["Status"] = status
+            row["Relation"] = relation # Update row for display if needed
+            
+            # Select correct columns based on page type
+            if is_same_arb_page:
+                # Page: Same Result. Show: Opposite Bets (Arb)
+                row["Best Sum"] = row.get("Best Arb Sum", "-")
+                row["Type"] = row.get("Arb Type", "-")
+                row["Rec Time"] = row.get("Arb Time", "-")
+            else:
+                # Page: Opposite Result. Show: Same Bets (Same)
+                row["Best Sum"] = row.get("Best Same Sum", "-")
+                row["Type"] = row.get("Same Type", "-")
+                row["Rec Time"] = row.get("Same Time", "-")
+
+            processed_data.append(row)
+            
+        df_res = pd.DataFrame(processed_data)
+        
+        # Drop timestamp col for display but keep in state
+        if not df_res.empty:
+            cols_order = ["Time", "Status", "BTC Result", "ETH Result", "Relation", "Best Sum", "Type", "Rec Time", "BTC Slug", "ETH Slug"]
+            # Filter cols that exist
+            cols_to_show = [c for c in cols_order if c in df_res.columns]
+            
+            df_display = df_res[cols_to_show].copy()
+            df_display = df_display.sort_values(by="Time", ascending=False)
+            st.dataframe(df_display, use_container_width=True)
+            
+            # Calculate stats
+            if resolved_count > 0:
+                st.metric(f"{target_relation} Success Rate", f"{valid_count}/{resolved_count}", f"{(valid_count/resolved_count)*100:.1f}%")
+            else:
+                st.info("No resolved rounds yet.")
     else:
         st.info("No data yet.")
