@@ -44,6 +44,7 @@ WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 HISTORY_FILE = "btc_15m_history.csv" # Legacy file, we will use round_history.csv for pairs
 ROUND_HISTORY_FILE = "round_history.csv"
 ARB_OPPORTUNITY_FILE = "arb_opportunities.csv"
+MULTI_ASSET_HISTORY_FILE = "multi_asset_history.csv"
 
 def get_slug_from_url(url):
     """Parse the slug from a Polymarket URL."""
@@ -173,14 +174,15 @@ def save_round_history(btc_slug, eth_slug):
             f.write("timestamp,btc_slug,eth_slug\n")
         f.write(f"{timestamp},{btc_slug},{eth_slug}\n")
 
-def save_arb_opportunity(btc_slug, eth_slug, type_name, sum_val, btc_ask, eth_ask):
+def save_arb_opportunity(slug_a, slug_b, type_name, sum_val, ask_a, ask_b, pair_name="BTC-ETH"):
     """Save arbitrage opportunity."""
     timestamp = int(time.time())
     file_exists = os.path.isfile(ARB_OPPORTUNITY_FILE)
     with open(ARB_OPPORTUNITY_FILE, "a") as f:
         if not file_exists:
-            f.write("timestamp,type,sum,btc_ask,eth_ask,btc_slug,eth_slug\n")
-        f.write(f"{timestamp},{type_name},{sum_val},{btc_ask},{eth_ask},{btc_slug},{eth_slug}\n")
+            # Added pair column at the end to maintain some backward compatibility for reading if robust
+            f.write("timestamp,type,sum,ask_a,ask_b,slug_a,slug_b,pair\n")
+        f.write(f"{timestamp},{type_name},{sum_val},{ask_a},{ask_b},{slug_a},{slug_b},{pair_name}\n")
 
 # --- WebSocket Manager (Reuse) ---
 class PolymarketWSManager:
@@ -340,7 +342,7 @@ if not ws_manager.is_running:
     ws_manager.start()
 
 # --- Navigation ---
-page = st.sidebar.radio("Navigation", ["Monitor", "Arb History", "同向套利", "异向套利"])
+page = st.sidebar.radio("Navigation", ["Monitor", "Arb History", "同向套利", "异向套利", "多币种同向分析"])
 
 # Load settings on startup (moved after page config)
 loaded_settings = load_settings()
@@ -387,6 +389,8 @@ if page == "Monitor":
         st.header("Control Panel")
         btc_seed_slug = st.text_input("BTC Seed Slug:", value="btc-updown-15m-1767105000")
         eth_seed_slug = st.text_input("ETH Seed Slug:", value="eth-updown-15m-1767105900")
+        sol_seed_slug = st.text_input("SOL Seed Slug:", value="sol-updown-15m-1767105000")
+        xrp_seed_slug = st.text_input("XRP Seed Slug:", value="xrp-updown-15m-1767105000")
         auto_mode = st.toggle("Enable Auto-Rollover & Recording", value=True)
         
         with st.expander("Arbitrage Recording Settings"):
@@ -420,62 +424,71 @@ if page == "Monitor":
         
     if "current_eth_slug" not in st.session_state:
         st.session_state["current_eth_slug"] = get_latest_active_slug("eth-updown-15m")
-        
-    # Min value tracking for Arb
-    if "min_sum_1" not in st.session_state: st.session_state["min_sum_1"] = 1.0 # BTC Up + ETH Down
-    if "min_sum_2" not in st.session_state: st.session_state["min_sum_2"] = 1.0 # BTC Down + ETH Up
-    # Min value tracking for Same Direction
-    if "min_same_sum_1" not in st.session_state: st.session_state["min_same_sum_1"] = 2.0 # BTC Up + ETH Up (Default higher)
-    if "min_same_sum_2" not in st.session_state: st.session_state["min_same_sum_2"] = 2.0 # BTC Down + ETH Down
 
+    if "current_sol_slug" not in st.session_state:
+        st.session_state["current_sol_slug"] = get_latest_active_slug("sol-updown-15m")
+        
+    if "current_xrp_slug" not in st.session_state:
+        st.session_state["current_xrp_slug"] = get_latest_active_slug("xrp-updown-15m")
+
+    # Min value tracking for Arb (Generalize or keep specific?)
+    # For now, we will use a dict to track min values for all pairs to be dynamic
+    if "pair_min_values" not in st.session_state:
+        st.session_state["pair_min_values"] = {} 
+        # Structure: {"BTC-ETH": {"arb_1": 1.0, "arb_2": 1.0, "same_1": 2.0, "same_2": 2.0}}
+    
+    # Backward compatibility for existing BTC/ETH specific keys if used elsewhere?
+    # We'll just leave them but transition to the dict for the loop.
+    
     # Use st.empty() for the entire main area to prevent duplication
     main_placeholder = st.empty()
 
     # Fetch Data First
     btc_slug = st.session_state["current_btc_slug"]
     eth_slug = st.session_state["current_eth_slug"]
+    sol_slug = st.session_state["current_sol_slug"]
+    xrp_slug = st.session_state["current_xrp_slug"]
     
     btc_markets, _ = fetch_market_data(btc_slug)
     eth_markets, _ = fetch_market_data(eth_slug)
+    sol_markets, _ = fetch_market_data(sol_slug)
+    xrp_markets, _ = fetch_market_data(xrp_slug)
     
-    btc_tokens = []
-    eth_tokens = []
-    btc_closed = False
-    eth_closed = False
-    
-    # Process BTC
-    if btc_markets:
-        m = btc_markets[0]
-        btc_closed = m.get("closed", False)
-        if not btc_closed:
-            outcomes = parse_json_field(m.get("outcomes", []))
-            ids = parse_json_field(m.get("clobTokenIds", []))
-            for i, tid in enumerate(ids):
-                o = outcomes[i] if i < len(outcomes) else str(i)
-                btc_tokens.append({"outcome": o, "token_id": tid})
+    def extract_tokens(markets):
+        tokens = []
+        is_closed = False
+        if markets:
+            m = markets[0]
+            is_closed = m.get("closed", False)
+            if not is_closed:
+                outcomes = parse_json_field(m.get("outcomes", []))
+                ids = parse_json_field(m.get("clobTokenIds", []))
+                for i, tid in enumerate(ids):
+                    o = outcomes[i] if i < len(outcomes) else str(i)
+                    tokens.append({"outcome": o, "token_id": tid})
+        return tokens, is_closed
 
-    # Process ETH
-    if eth_markets:
-        m = eth_markets[0]
-        eth_closed = m.get("closed", False)
-        if not eth_closed:
-            outcomes = parse_json_field(m.get("outcomes", []))
-            ids = parse_json_field(m.get("clobTokenIds", []))
-            for i, tid in enumerate(ids):
-                o = outcomes[i] if i < len(outcomes) else str(i)
-                eth_tokens.append({"outcome": o, "token_id": tid})
+    btc_tokens, btc_closed = extract_tokens(btc_markets)
+    eth_tokens, eth_closed = extract_tokens(eth_markets)
+    sol_tokens, sol_closed = extract_tokens(sol_markets)
+    xrp_tokens, xrp_closed = extract_tokens(xrp_markets)
 
     # Subscribe & Warmup Combined
-    all_token_ids = [t["token_id"] for t in btc_tokens] + [t["token_id"] for t in eth_tokens]
+    all_token_ids = []
+    for t_list in [btc_tokens, eth_tokens, sol_tokens, xrp_tokens]:
+        all_token_ids.extend([t["token_id"] for t in t_list])
+        
     if all_token_ids:
         ws_manager.subscribe(all_token_ids)
-        # Warmup if needed (using a simple session state key check to avoid spamming REST API on every rerun)
-        warmup_key = f"warmed_{btc_slug}_{eth_slug}"
+        # Warmup if needed
+        warmup_key = f"warmed_{btc_slug}_{eth_slug}_{sol_slug}_{xrp_slug}"
         if not st.session_state.get(warmup_key):
             ws_manager.warmup_cache(all_token_ids)
             st.session_state[warmup_key] = True
 
     # --- Real-time Loop ---
+    # Only render if at least BTC/ETH are active, but we should process all if possible.
+    # For UI simplicity, we keep showing BTC/ETH as main, but process others in background.
     if not btc_closed and not eth_closed and btc_tokens and eth_tokens:
         
         # 1. Setup Placeholders for Dynamic Content (Static Layout)
@@ -513,8 +526,13 @@ if page == "Monitor":
                 last_ui_update = now
                 
                 # Fetch Prices (Fast dict lookup)
-                btc_prices = {t["outcome"]: ws_manager.get_price(t["token_id"]) for t in btc_tokens}
-                eth_prices = {t["outcome"]: ws_manager.get_price(t["token_id"]) for t in eth_tokens}
+                def get_prices(tokens):
+                    return {t["outcome"]: ws_manager.get_price(t["token_id"]) for t in tokens}
+
+                btc_prices = get_prices(btc_tokens)
+                eth_prices = get_prices(eth_tokens)
+                sol_prices = get_prices(sol_tokens)
+                xrp_prices = get_prices(xrp_tokens)
                 
                 # --- Render Timer ---
                 with timer_placeholder.container():
@@ -546,7 +564,7 @@ if page == "Monitor":
                     except:
                         st.write("Time Remaining: N/A")
 
-                # --- Render Calcs ---
+                # --- Render Calcs & Background Record ---
                 with calc_placeholder.container():
                     try:
                         def safe_float(val):
@@ -560,22 +578,43 @@ if page == "Monitor":
                             if outcome_name == "No": return safe_float(prices.get("Down", {}).get("ask"))
                             return 999.0
 
-                        btc_up_ask = get_ask(btc_prices, "Yes")
-                        btc_down_ask = get_ask(btc_prices, "No")
-                        eth_up_ask = get_ask(eth_prices, "Yes")
-                        eth_down_ask = get_ask(eth_prices, "No")
+                        # Helper to process a pair
+                        def process_pair(name_a, name_b, prices_a, prices_b, slug_a, slug_b):
+                            up_a = get_ask(prices_a, "Yes")
+                            down_a = get_ask(prices_a, "No")
+                            up_b = get_ask(prices_b, "Yes")
+                            down_b = get_ask(prices_b, "No")
+                            
+                            s1 = up_a + down_b # Arb 1
+                            s2 = down_a + up_b # Arb 2
+                            ss1 = up_a + up_b  # Same 1
+                            ss2 = down_a + down_b # Same 2
+                            
+                            return {
+                                "arb_1": (s1, "BTC_Up_ETH_Down", up_a, down_b), # Type names legacy, maybe generalize?
+                                "arb_2": (s2, "BTC_Down_ETH_Up", down_a, up_b),
+                                "same_1": (ss1, "BTC_Up_ETH_Up", up_a, up_b),
+                                "same_2": (ss2, "BTC_Down_ETH_Down", down_a, down_b)
+                            }
+
+                        # Define all pairs to monitor
+                        pairs_config = [
+                            ("BTC", "ETH", btc_prices, eth_prices, btc_slug, eth_slug),
+                            ("BTC", "SOL", btc_prices, sol_prices, btc_slug, sol_slug),
+                            ("BTC", "XRP", btc_prices, xrp_prices, btc_slug, xrp_slug),
+                            ("ETH", "SOL", eth_prices, sol_prices, eth_slug, sol_slug),
+                            ("ETH", "XRP", eth_prices, xrp_prices, eth_slug, xrp_slug),
+                            ("SOL", "XRP", sol_prices, xrp_prices, sol_slug, xrp_slug),
+                        ]
                         
-                        sum_1 = btc_up_ask + eth_down_ask
-                        sum_2 = btc_down_ask + eth_up_ask
-                        sum_same_1 = btc_up_ask + eth_up_ask
-                        sum_same_2 = btc_down_ask + eth_down_ask
+                        # Only show BTC-ETH in UI for simplicity
+                        res_btc_eth = process_pair("BTC", "ETH", btc_prices, eth_prices, btc_slug, eth_slug)
+                        st.write(f"**BTC Up + ETH Down (Ask Sum): {res_btc_eth['arb_1'][0]:.4f}**")
+                        st.write(f"**BTC Down + ETH Up (Ask Sum): {res_btc_eth['arb_2'][0]:.4f}**")
+                        st.write(f"**BTC Up + ETH Up (Same Dir): {res_btc_eth['same_1'][0]:.4f}**")
+                        st.write(f"**BTC Down + ETH Down (Same Dir): {res_btc_eth['same_2'][0]:.4f}**")
                         
-                        st.write(f"**BTC Up + ETH Down (Ask Sum): {sum_1:.4f}**")
-                        st.write(f"**BTC Down + ETH Up (Ask Sum): {sum_2:.4f}**")
-                        st.write(f"**BTC Up + ETH Up (Same Dir): {sum_same_1:.4f}**")
-                        st.write(f"**BTC Down + ETH Down (Same Dir): {sum_same_2:.4f}**")
-                        
-                        # Record Logic
+                        # Record Logic for ALL pairs
                         threshold_sum = st.session_state.get("arb_sum_threshold", 0.8)
                         threshold_drop = st.session_state.get("arb_drop_threshold", 0.03)
                         threshold_time_mins = st.session_state.get("arb_time_threshold", 5)
@@ -586,6 +625,8 @@ if page == "Monitor":
 
                         should_record_time = True
                         should_record_same_time = True
+                        
+                        # Time check (based on BTC market end time as reference for all 15m markets)
                         try:
                             end_ts = 0
                             if btc_markets and len(btc_markets) > 0:
@@ -610,31 +651,66 @@ if page == "Monitor":
                         except:
                             pass 
 
-                        if should_record_time:
-                            if sum_1 <= threshold_sum:
-                                if st.session_state["min_sum_1"] == 1.0 or sum_1 < (st.session_state["min_sum_1"] - threshold_drop):
-                                    save_arb_opportunity(btc_slug, eth_slug, "BTC_Up_ETH_Down", sum_1, btc_up_ask, eth_down_ask)
-                                    st.session_state["min_sum_1"] = sum_1
-                                    st.toast(f"New Low Arb 1: {sum_1:.4f} Recorded!", icon="📉")
-                                    
-                            if sum_2 <= threshold_sum:
-                                if st.session_state["min_sum_2"] == 1.0 or sum_2 < (st.session_state["min_sum_2"] - threshold_drop):
-                                    save_arb_opportunity(btc_slug, eth_slug, "BTC_Down_ETH_Up", sum_2, btc_down_ask, eth_up_ask)
-                                    st.session_state["min_sum_2"] = sum_2
-                                    st.toast(f"New Low Arb 2: {sum_2:.4f} Recorded!", icon="📉")
+                        # Loop through all pairs and record
+                        for p_name_a, p_name_b, p_prices_a, p_prices_b, p_slug_a, p_slug_b in pairs_config:
+                            pair_key = f"{p_name_a}-{p_name_b}"
+                            
+                            # Skip if markets not loaded
+                            if not p_prices_a or not p_prices_b: continue
+                            
+                            res = process_pair(p_name_a, p_name_b, p_prices_a, p_prices_b, p_slug_a, p_slug_b)
+                            
+                            # Get min values for this pair
+                            if pair_key not in st.session_state["pair_min_values"]:
+                                st.session_state["pair_min_values"][pair_key] = {
+                                    "arb_1": 1.0, "arb_2": 1.0, "same_1": 2.0, "same_2": 2.0
+                                }
+                            mins = st.session_state["pair_min_values"][pair_key]
 
-                        if should_record_same_time:
-                            if sum_same_1 <= same_threshold_sum:
-                                if st.session_state["min_same_sum_1"] == 2.0 or sum_same_1 < (st.session_state["min_same_sum_1"] - same_threshold_drop):
-                                    save_arb_opportunity(btc_slug, eth_slug, "BTC_Up_ETH_Up", sum_same_1, btc_up_ask, eth_up_ask)
-                                    st.session_state["min_same_sum_1"] = sum_same_1
-                                    st.toast(f"New Low Same 1: {sum_same_1:.4f} Recorded!", icon="📉")
-                                    
-                            if sum_same_2 <= same_threshold_sum:
-                                if st.session_state["min_same_sum_2"] == 2.0 or sum_same_2 < (st.session_state["min_same_sum_2"] - same_threshold_drop):
-                                    save_arb_opportunity(btc_slug, eth_slug, "BTC_Down_ETH_Down", sum_same_2, btc_down_ask, eth_down_ask)
-                                    st.session_state["min_same_sum_2"] = sum_same_2
-                                    st.toast(f"New Low Same 2: {sum_same_2:.4f} Recorded!", icon="📉")
+                            # Check Arb
+                            if should_record_time:
+                                # Arb 1
+                                val, type_base, ask_a, ask_b = res["arb_1"]
+                                # Construct type name dynamically: A_Up_B_Down
+                                type_real = f"{p_name_a}_Up_{p_name_b}_Down"
+                                if val <= threshold_sum:
+                                    if mins["arb_1"] == 1.0 or val < (mins["arb_1"] - threshold_drop):
+                                        save_arb_opportunity(p_slug_a, p_slug_b, type_real, val, ask_a, ask_b, pair_key)
+                                        mins["arb_1"] = val
+                                        if pair_key == "BTC-ETH": # Toast only main
+                                            st.toast(f"New Low Arb 1 ({pair_key}): {val:.4f}", icon="📉")
+                                
+                                # Arb 2
+                                val, type_base, ask_a, ask_b = res["arb_2"]
+                                type_real = f"{p_name_a}_Down_{p_name_b}_Up"
+                                if val <= threshold_sum:
+                                    if mins["arb_2"] == 1.0 or val < (mins["arb_2"] - threshold_drop):
+                                        save_arb_opportunity(p_slug_a, p_slug_b, type_real, val, ask_a, ask_b, pair_key)
+                                        mins["arb_2"] = val
+                                        if pair_key == "BTC-ETH":
+                                            st.toast(f"New Low Arb 2 ({pair_key}): {val:.4f}", icon="📉")
+
+                            # Check Same
+                            if should_record_same_time:
+                                # Same 1
+                                val, type_base, ask_a, ask_b = res["same_1"]
+                                type_real = f"{p_name_a}_Up_{p_name_b}_Up"
+                                if val <= same_threshold_sum:
+                                    if mins["same_1"] == 2.0 or val < (mins["same_1"] - same_threshold_drop):
+                                        save_arb_opportunity(p_slug_a, p_slug_b, type_real, val, ask_a, ask_b, pair_key)
+                                        mins["same_1"] = val
+                                        if pair_key == "BTC-ETH":
+                                            st.toast(f"New Low Same 1 ({pair_key}): {val:.4f}", icon="📉")
+                                
+                                # Same 2
+                                val, type_base, ask_a, ask_b = res["same_2"]
+                                type_real = f"{p_name_a}_Down_{p_name_b}_Down"
+                                if val <= same_threshold_sum:
+                                    if mins["same_2"] == 2.0 or val < (mins["same_2"] - same_threshold_drop):
+                                        save_arb_opportunity(p_slug_a, p_slug_b, type_real, val, ask_a, ask_b, pair_key)
+                                        mins["same_2"] = val
+                                        if pair_key == "BTC-ETH":
+                                            st.toast(f"New Low Same 2 ({pair_key}): {val:.4f}", icon="📉")
                                 
                     except ValueError:
                         pass
@@ -758,19 +834,22 @@ elif page == "Arb History":
                 df_arb = df_arb.sort_values(by="Time", ascending=False)
 
                 # Reorder columns
-                cols = ["Time", "type", "sum", "btc_ask", "eth_ask", "btc_slug", "eth_slug"]
+                # Updated to match new schema
+                cols = ["Time", "type", "sum", "ask_a", "ask_b", "slug_a", "slug_b", "pair"]
+                # Filter cols that exist
+                cols = [c for c in cols if c in df_arb.columns]
                 df_arb = df_arb[cols]
                 
                 # Define a function to style rows based on Slug
                 def highlight_slug_groups(row):
-                    # Use the BTC slug as a unique identifier for the "round"
+                    # Use the slug_a as a unique identifier for the "round"
                     # We can hash the slug string to get a color hue?
                     # Or simpler: alternating colors based on group?
                     # Streamlit st.dataframe styling is limited for whole-row coloring based on value easily without complex logic.
                     # But we can try to color specific cells or use 'background-color' property.
                     
-                    # Simple approach: Hash the btc_slug to a hex color (light pastel)
-                    slug = row["btc_slug"]
+                    # Simple approach: Hash the slug_a to a hex color (light pastel)
+                    slug = row.get("slug_a", "")
                     hash_val = hash(slug)
                     # Generate a pastel color
                     r = (hash_val & 0xFF0000) >> 16
@@ -831,6 +910,9 @@ def fetch_rounds_data(ts_list):
     if os.path.exists(ARB_OPPORTUNITY_FILE):
         try:
             df_arb_all = pd.read_csv(ARB_OPPORTUNITY_FILE)
+            # Ensure column compatibility if reading from mixed sources (though we migrated)
+            if "btc_slug" in df_arb_all.columns and "slug_a" not in df_arb_all.columns:
+                df_arb_all.rename(columns={"btc_slug": "slug_a", "eth_slug": "slug_b"}, inplace=True)
         except: pass
 
     # Fetch in parallel
@@ -861,9 +943,9 @@ def fetch_rounds_data(ts_list):
         best_same_type = ""
         best_same_time = ""
         
-        if not df_arb_all.empty and "btc_slug" in df_arb_all.columns:
+        if not df_arb_all.empty and "slug_a" in df_arb_all.columns:
             # Filter for this round
-            round_arbs = df_arb_all[df_arb_all["btc_slug"] == btc_slug]
+            round_arbs = df_arb_all[df_arb_all["slug_a"] == btc_slug]
             
             if not round_arbs.empty:
                 # 1. Process Opposite (Arb) Bets
@@ -1074,3 +1156,242 @@ if page in ["同向套利", "异向套利"]:
                 st.info("No resolved rounds yet.")
     else:
         st.info("No data yet.")
+
+# --- PAGE: Multi-Asset Analysis ---
+elif page == "多币种同向分析":
+    st.title("多币种同向分析 (Multi-Asset Correlation) 📊")
+    
+    # --- Sidebar Config ---
+    with st.sidebar:
+        st.divider()
+        st.header("Multi-Asset Settings")
+        # Reuse BTC/ETH seeds from top but add SOL/XRP
+        sol_seed_slug = st.text_input("SOL Seed Slug:", value="sol-updown-15m-1767105000")
+        xrp_seed_slug = st.text_input("XRP Seed Slug:", value="xrp-updown-15m-1767105000")
+        
+        # Action Buttons
+        if st.button("📥 加载/更新历史 (1000条)"):
+            # 1. Load existing
+            existing_data = {}
+            if os.path.exists(MULTI_ASSET_HISTORY_FILE):
+                try:
+                    df_exist = pd.read_csv(MULTI_ASSET_HISTORY_FILE)
+                    if not df_exist.empty:
+                        for _, row in df_exist.iterrows():
+                            existing_data[row["timestamp"]] = row.to_dict()
+                except: pass
+            
+            # 2. Determine range (Last 1000 rounds)
+            now = int(time.time())
+            current_block_start = (now // 900) * 900
+            target_timestamps = [current_block_start - (i * 900) for i in range(1000)]
+            
+            # 3. Identify missing
+            missing_ts = [ts for ts in target_timestamps if ts not in existing_data]
+            
+            # 4. Fetch Missing (Batch)
+            if missing_ts:
+                from concurrent.futures import ThreadPoolExecutor
+                
+                # Progress bar
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                # Parse prefixes from user input
+                sol_prefix = "-".join(sol_seed_slug.split("-")[:-1])
+                xrp_prefix = "-".join(xrp_seed_slug.split("-")[:-1])
+                
+                # Use a safe fallback that doesn't depend on global widget variables
+                btc_prefix = "btc-updown-15m"
+                eth_prefix = "eth-updown-15m"
+                
+                try:
+                    # Attempt to parse from sol prefix (assuming user keeps consistent format)
+                    # e.g., sol-updown-15m -> btc-updown-15m
+                    parts = sol_prefix.split("-")
+                    if len(parts) > 1:
+                        suffix = "-".join(parts[1:])
+                        btc_prefix = f"btc-{suffix}"
+                        eth_prefix = f"eth-{suffix}"
+                except:
+                    pass
+
+                def fetch_multi_round(ts):
+                    # Construct slugs
+                    btc_s = f"{btc_prefix}-{ts}"
+                    eth_s = f"{eth_prefix}-{ts}"
+                    sol_s = f"{sol_prefix}-{ts}"
+                    xrp_s = f"{xrp_prefix}-{ts}"
+                    
+                    return {
+                        "timestamp": ts,
+                        "Time": datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S'),
+                        "btc_res": get_market_winner(btc_s),
+                        "eth_res": get_market_winner(eth_s),
+                        "sol_res": get_market_winner(sol_s),
+                        "xrp_res": get_market_winner(xrp_s)
+                    }
+
+                new_records = []
+                batch_size = 20
+                total_batches = (len(missing_ts) + batch_size - 1) // batch_size
+                
+                for i in range(0, len(missing_ts), batch_size):
+                    batch = missing_ts[i:i+batch_size]
+                    with ThreadPoolExecutor(max_workers=10) as executor: # Limit concurrency
+                        results = list(executor.map(fetch_multi_round, batch))
+                        new_records.extend(results)
+                    
+                    # Update progress
+                    current_batch = (i // batch_size) + 1
+                    progress = min(current_batch / total_batches, 1.0)
+                    progress_bar.progress(progress)
+                    status_text.text(f"Fetching batch {current_batch}/{total_batches}...")
+                    time.sleep(0.5) # Rate limit protection
+                
+                # Merge and Save
+                for r in new_records:
+                    existing_data[r["timestamp"]] = r
+                
+                # Convert back to list and sort
+                final_list = list(existing_data.values())
+                final_list.sort(key=lambda x: x["timestamp"], reverse=True)
+                
+                # Save
+                pd.DataFrame(final_list).to_csv(MULTI_ASSET_HISTORY_FILE, index=False)
+                st.success(f"Updated {len(new_records)} new records!")
+                st.rerun()
+            else:
+                st.info("Data is already up to date.")
+
+    # --- Main Analysis UI ---
+    
+    # 1. Load Data
+    df = pd.DataFrame()
+    if os.path.exists(MULTI_ASSET_HISTORY_FILE):
+        try:
+            df = pd.read_csv(MULTI_ASSET_HISTORY_FILE)
+        except: pass
+        
+    if not df.empty:
+        # 2. Filters
+        c1, c2 = st.columns([1, 3])
+        with c1:
+            pair = st.selectbox("选择交易对 (Select Pair)", [
+                "BTC vs ETH", "BTC vs SOL", "BTC vs XRP",
+                "ETH vs SOL", "ETH vs XRP",
+                "SOL vs XRP"
+            ])
+            
+        asset_a_name, asset_b_name = pair.split(" vs ")
+        col_a = f"{asset_a_name.lower()}_res"
+        col_b = f"{asset_b_name.lower()}_res"
+        
+        # 3. Process Data
+        # Filter out invalid rows for statistics
+        valid_df = df[
+            (~df[col_a].isin(["Pending", "Pending (Closed)", "Active", "Error", "Not Found"])) &
+            (~df[col_b].isin(["Pending", "Pending (Closed)", "Active", "Error", "Not Found"]))
+        ].copy()
+        
+        # Calculate Relation
+        valid_df["is_same"] = valid_df[col_a] == valid_df[col_b]
+        
+        # Stats
+        total_samples = len(valid_df)
+        same_count = valid_df["is_same"].sum()
+        corr_rate = (same_count / total_samples * 100) if total_samples > 0 else 0
+        
+        # Display Stats
+        st.metric(
+            label=f"同向占比 (Correlation Rate) - {pair}",
+            value=f"{corr_rate:.1f}%",
+            delta=f"样本数: {total_samples}"
+        )
+
+        # --- Best Price Integration ---
+        # Load Arb Data
+        best_prices = {} # Map: round_ts -> min_sum
+        if os.path.exists(ARB_OPPORTUNITY_FILE):
+            try:
+                df_arb = pd.read_csv(ARB_OPPORTUNITY_FILE)
+                if not df_arb.empty:
+                    # Handle backward compatibility for 'pair' column and slug names
+                    if "pair" not in df_arb.columns:
+                        df_arb["pair"] = "BTC-ETH"
+                        # Rename legacy columns to match new generic schema
+                        rename_map = {}
+                        if "btc_slug" in df_arb.columns: rename_map["btc_slug"] = "slug_a"
+                        if "eth_slug" in df_arb.columns: rename_map["eth_slug"] = "slug_b"
+                        if rename_map:
+                            df_arb.rename(columns=rename_map, inplace=True)
+                    
+                    # Filter for current selected pair
+                    target_pair = f"{asset_a_name}-{asset_b_name}"
+                    df_arb_pair = df_arb[df_arb["pair"] == target_pair].copy()
+                    
+                    if not df_arb_pair.empty:
+                        # Extract round timestamp from slug_a
+                        # Assuming slug format ends with -{timestamp}
+                        def extract_round_ts(slug):
+                            try:
+                                return int(slug.split("-")[-1])
+                            except:
+                                return 0
+                        
+                        df_arb_pair["round_ts"] = df_arb_pair["slug_a"].apply(extract_round_ts)
+                        
+                        # Filter for SAME direction types
+                        # Dynamic type check: {AssetA}_Up_{AssetB}_Up or {AssetA}_Down_{AssetB}_Down
+                        type_up_up = f"{asset_a_name}_Up_{asset_b_name}_Up"
+                        type_down_down = f"{asset_a_name}_Down_{asset_b_name}_Down"
+                        
+                        df_same = df_arb_pair[df_arb_pair["type"].isin([type_up_up, type_down_down])]
+                        
+                        if not df_same.empty:
+                            # Group by round_ts and take min sum
+                            min_series = df_same.groupby("round_ts")["sum"].min()
+                            best_prices = min_series.to_dict()
+            except Exception as e:
+                # st.error(f"Error loading best prices: {e}")
+                pass
+
+        # 4. Detailed Table
+        st.subheader("详细历史数据")
+        
+        # Prepare display dataframe from ORIGINAL df to show pending ones too
+        display_df = df.copy()
+        display_df["Relation"] = display_df.apply(
+            lambda row: "✅ 同向" if row[col_a] == row[col_b] else "❌ 异向", axis=1
+        )
+        
+        # Handle pending/error visual
+        def refine_relation(row):
+            v_a = row[col_a]
+            v_b = row[col_b]
+            if v_a in ["Pending", "Active", "Pending (Closed)"] or v_b in ["Pending", "Active", "Pending (Closed)"]:
+                return "⏳ Pending"
+            if v_a == "Error" or v_b == "Error":
+                return "⚠️ Error"
+            return "✅ 同向" if v_a == v_b else "❌ 异向"
+            
+        display_df["Relation"] = display_df.apply(refine_relation, axis=1)
+        
+        # Add Best Price Column
+        def get_best_price(row):
+            ts = row["timestamp"]
+            return f"{best_prices[ts]:.4f}" if ts in best_prices else "-"
+            
+        display_df["Same Dir Best Price"] = display_df.apply(get_best_price, axis=1)
+        
+        # Select columns
+        cols = ["Time", col_a, col_b, "Relation", "Same Dir Best Price"]
+        display_df = display_df[cols].sort_values(by="Time", ascending=False)
+        
+        # Rename for display
+        display_df.columns = ["Time", f"{asset_a_name} Result", f"{asset_b_name} Result", "Relation", "Same Dir Best Price"]
+        
+        st.dataframe(display_df, use_container_width=True)
+        
+    else:
+        st.info("No data loaded. Please click '📥 加载/更新历史' in the sidebar.")
