@@ -1186,8 +1186,28 @@ elif page == "多币种同向分析":
             current_block_start = (now // 900) * 900
             target_timestamps = [current_block_start - (i * 900) for i in range(1000)]
             
-            # 3. Identify missing
-            missing_ts = [ts for ts in target_timestamps if ts not in existing_data]
+            # 3. Identify missing or pending
+            missing_ts = []
+            
+            # Statuses that need refresh
+            pending_statuses = ["Active", "Pending", "Pending (Closed)", "Error", "Not Found", "Unknown"]
+            
+            for ts in target_timestamps:
+                if ts not in existing_data:
+                    missing_ts.append(ts)
+                else:
+                    # Check if any asset result is pending/active
+                    row = existing_data[ts]
+                    needs_refresh = False
+                    for key in ["btc_res", "eth_res", "sol_res", "xrp_res"]:
+                        if row.get(key) in pending_statuses:
+                            needs_refresh = True
+                            break
+                    if needs_refresh:
+                        missing_ts.append(ts)
+            
+            # Remove duplicates just in case
+            missing_ts = list(set(missing_ts))
             
             # 4. Fetch Missing (Batch)
             if missing_ts:
