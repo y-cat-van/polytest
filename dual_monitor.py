@@ -100,7 +100,7 @@ def parse_json_field(field_value):
             return []
     return field_value
 
-@st.cache_data(ttl=15)
+@st.cache_data(ttl=5)
 def fetch_market_data(slug):
     try:
         url = f"{GAMMA_API_URL}/events"
@@ -319,39 +319,39 @@ class PolymarketWSManager:
             try: best_ask = min(asks, key=lambda x: float(x["price"]))["price"]
             except: pass
         with self.lock:
-            self.prices[token_id] = {"bid": best_bid, "ask": best_ask}
+            self.prices[token_id] = {"bid": best_bid, "ask": best_ask, "ts": time.time()}
             self.last_update = time.time()
 
     def _update_price_direct(self, token_id, bid, ask):
         with self.lock:
-            current = self.prices.get(token_id, {"bid": "N/A", "ask": "N/A"})
+            current = self.prices.get(token_id, {"bid": "N/A", "ask": "N/A", "ts": 0})
             new_bid = bid if bid is not None else current["bid"]
             new_ask = ask if ask is not None else current["ask"]
-            self.prices[token_id] = {"bid": new_bid, "ask": new_ask}
+            self.prices[token_id] = {"bid": new_bid, "ask": new_ask, "ts": time.time()}
             self.last_update = time.time()
 
     def get_price(self, token_id):
         with self.lock:
-            return self.prices.get(token_id, {"bid": "Loading...", "ask": "Loading..."})
+            return self.prices.get(token_id, {"bid": "Loading...", "ask": "Loading...", "ts": 0})
 
-    def warmup_cache(self, token_ids):
+    def fetch_snapshot(self, token_ids):
+        """Force fetch latest prices via HTTP for given tokens."""
         def fetch_single(token_id):
             try:
                 url = f"{CLOB_API_URL}/book"
                 params = {"token_id": token_id}
-                response = requests.get(url, params=params, verify=False, timeout=5)
+                response = requests.get(url, params=params, verify=False, timeout=3)
                 if response.status_code == 200:
                     data = response.json()
                     bids = data.get("bids", [])
                     asks = data.get("asks", [])
                     self._update_price_from_book(token_id, bids, asks)
             except Exception as e:
-                print(f"Warmup error: {e}")
-        threading.Thread(target=lambda: self._warmup_worker(token_ids, fetch_single), daemon=True).start()
-
-    def _warmup_worker(self, token_ids, fetch_func):
+                print(f"Snapshot error for {token_id}: {e}")
+        
+        # Use a thread pool to fetch in parallel, but wait for completion
         with ThreadPoolExecutor(max_workers=20) as executor:
-            executor.map(fetch_func, token_ids)
+            list(executor.map(fetch_single, token_ids))
 
 # --- Background Monitor Core ---
 class MonitorCore:
@@ -360,6 +360,7 @@ class MonitorCore:
         self.running = False
         self.thread = None
         self.lock = threading.Lock()
+        self.processing_lock = threading.Lock()
         
         # State
         self.settings = load_settings()
@@ -443,7 +444,8 @@ class MonitorCore:
             self.tokens_15m[slug] = tokens
             if tokens:
                 self.ws_manager.subscribe([t["token_id"] for t in tokens])
-                self.ws_manager.warmup_cache([t["token_id"] for t in tokens])
+                # Warmup via fetch_snapshot (async non-blocking for init)
+                threading.Thread(target=lambda: self.ws_manager.fetch_snapshot([t["token_id"] for t in tokens]), daemon=True).start()
 
     def _update_tokens_1h(self):
         for slug in [self.btc_slug_1h, self.eth_slug_1h, self.sol_slug_1h, self.xrp_slug_1h]:
@@ -460,7 +462,7 @@ class MonitorCore:
             self.tokens_1h[slug] = tokens
             if tokens:
                 self.ws_manager.subscribe([t["token_id"] for t in tokens])
-                self.ws_manager.warmup_cache([t["token_id"] for t in tokens])
+                threading.Thread(target=lambda: self.ws_manager.fetch_snapshot([t["token_id"] for t in tokens]), daemon=True).start()
 
     def _loop(self):
         while self.running:
@@ -471,13 +473,40 @@ class MonitorCore:
                 # Retry token fetch if missing
                 if not self.tokens_15m.get(self.btc_slug_15m):
                      self._update_tokens_15m()
-                     
-                self._process_15m()
-                self._process_1h()
+                
+                with self.processing_lock:
+                    self._process_15m()
+                    self._process_1h()
+                
                 self._check_rollover_15m()
                 self._check_rollover_1h()
             except Exception as e:
                 print(f"Monitor Loop Error: {e}")
+
+    def force_process(self):
+        """Force an immediate calculation update."""
+        # Check staleness and force fetch if needed
+        all_tokens = []
+        for slug, tokens in self.tokens_15m.items():
+            all_tokens.extend([t["token_id"] for t in tokens])
+        for slug, tokens in self.tokens_1h.items():
+            all_tokens.extend([t["token_id"] for t in tokens])
+        
+        # Identify stale tokens (older than 5s)
+        now = time.time()
+        stale_ids = []
+        for tid in all_tokens:
+            p_data = self.ws_manager.prices.get(tid)
+            if not p_data or (now - p_data.get("ts", 0) > 5):
+                stale_ids.append(tid)
+        
+        if stale_ids:
+            # print(f"Refreshing {len(stale_ids)} stale tokens via HTTP...")
+            self.ws_manager.fetch_snapshot(stale_ids)
+
+        with self.processing_lock:
+            self._process_15m()
+            self._process_1h()
 
     def _sync_slugs_15m(self):
         # Safety check: if we are ahead of time (e.g. due to previous bug), reset to current.
@@ -543,8 +572,12 @@ class MonitorCore:
             
             key = f"{na}-{nb}"
             self.latest_15m[key] = {
-                "Up A + Down B": round(s1, 4),
-                "Down A + Up B": round(s2, 4),
+                "Up A": round(up_a, 4),
+                "Down B": round(down_b, 4),
+                "Sum 1 (Up A+Down B)": round(s1, 4),
+                "Down A": round(down_a, 4),
+                "Up B": round(up_b, 4),
+                "Sum 2 (Down A+Up B)": round(s2, 4),
                 "Time": datetime.datetime.now().strftime("%H:%M:%S")
             }
 
@@ -554,39 +587,69 @@ class MonitorCore:
             parts = self.btc_slug_15m.split("-")
             start_ts = int(parts[-1])
             end_ts = start_ts + 900
+            # If current time is past the recording cutoff (end - threshold), don't record
             if (end_ts - time.time()) < (self.settings.get("arb_time_threshold", 5) * 60):
                 should_record = False
         except: pass
 
-        if not should_record: return
+        # Always update mins_15m structure even if not recording, so UI shows default 1.0 or current low
+        for na, nb, _, _, _, _ in pairs:
+             key = f"{na}-{nb}"
+             if key not in self.mins_15m: self.mins_15m[key] = {"arb_1": 1.0, "arb_2": 1.0}
 
-        for na, nb, pa, pb, sa, sb in pairs:
-            if not pa or not pb: continue
-            
-            up_a = self._get_ask(pa, "Yes")
-            down_a = self._get_ask(pa, "No")
-            up_b = self._get_ask(pb, "Yes")
-            down_b = self._get_ask(pb, "No")
-            
-            s1 = up_a + down_b
-            s2 = down_a + up_b
-            
-            key = f"{na}-{nb}"
-            if key not in self.mins_15m: self.mins_15m[key] = {"arb_1": 1.0, "arb_2": 1.0}
-            
-            thresh = self.settings.get("arb_sum_threshold", 0.8)
-            drop = self.settings.get("arb_drop_threshold", 0.03)
-            
-            # Arb 1 (Up A + Down B)
-            if s1 <= thresh:
-                if self.mins_15m[key]["arb_1"] == 1.0 or s1 < (self.mins_15m[key]["arb_1"] - drop):
-                    save_arb_opportunity(sa, sb, f"{na}_Up_{nb}_Down", s1, up_a, down_b, key)
+        if should_record:
+            for na, nb, pa, pb, sa, sb in pairs:
+                if not pa or not pb: continue
+                
+                up_a = self._get_ask(pa, "Yes")
+                down_a = self._get_ask(pa, "No")
+                up_b = self._get_ask(pb, "Yes")
+                down_b = self._get_ask(pb, "No")
+                
+                s1 = up_a + down_b
+                s2 = down_a + up_b
+                
+                key = f"{na}-{nb}"
+                
+                thresh = self.settings.get("arb_sum_threshold", 0.8)
+                drop = self.settings.get("arb_drop_threshold", 0.03)
+                
+                # Arb 1 (Up A + Down B)
+                if s1 <= thresh:
+                    if self.mins_15m[key]["arb_1"] == 1.0 or s1 < (self.mins_15m[key]["arb_1"] - drop):
+                        save_arb_opportunity(sa, sb, f"{na}_Up_{nb}_Down", s1, up_a, down_b, key)
+                        self.mins_15m[key]["arb_1"] = s1
+                
+                # Arb 2 (Down A + Up B)
+                if s2 <= thresh:
+                    if self.mins_15m[key]["arb_2"] == 1.0 or s2 < (self.mins_15m[key]["arb_2"] - drop):
+                        save_arb_opportunity(sa, sb, f"{na}_Down_{nb}_Up", s2, down_a, up_b, key)
+                        self.mins_15m[key]["arb_2"] = s2
+        else:
+             # Even if not recording to CSV, we can optionally update the UI "mins" 
+             # to show the lowest value seen SO FAR in this session, 
+             # OR we keep it as is (only recording updates mins).
+             # User issue: Real-time snapshot shows low values (e.g. 0.91), but Current Mins shows 1.0 or 0.89.
+             # The issue is likely that "Current Mins" only updates when conditions are met AND within time window.
+             # Let's make "Current Mins" reflect the lowest value seen in this round, regardless of recording.
+             
+            for na, nb, pa, pb, _, _ in pairs:
+                if not pa or not pb: continue
+                
+                up_a = self._get_ask(pa, "Yes")
+                down_a = self._get_ask(pa, "No")
+                up_b = self._get_ask(pb, "Yes")
+                down_b = self._get_ask(pb, "No")
+                
+                s1 = up_a + down_b
+                s2 = down_a + up_b
+                
+                key = f"{na}-{nb}"
+                
+                # Just update in-memory minimums for UI display
+                if s1 < self.mins_15m[key]["arb_1"]:
                     self.mins_15m[key]["arb_1"] = s1
-            
-            # Arb 2 (Down A + Up B)
-            if s2 <= thresh:
-                if self.mins_15m[key]["arb_2"] == 1.0 or s2 < (self.mins_15m[key]["arb_2"] - drop):
-                    save_arb_opportunity(sa, sb, f"{na}_Down_{nb}_Up", s2, down_a, up_b, key)
+                if s2 < self.mins_15m[key]["arb_2"]:
                     self.mins_15m[key]["arb_2"] = s2
 
     def _process_1h(self):
@@ -620,15 +683,38 @@ class MonitorCore:
             
             key = f"{na}-{nb}"
             self.latest_1h[key] = {
-                "Up A + Down B": round(s1, 4),
-                "Down A + Up B": round(s2, 4),
+                "Up A": round(up_a, 4),
+                "Down B": round(down_b, 4),
+                "Sum 1 (Up A+Down B)": round(s1, 4),
+                "Down A": round(down_a, 4),
+                "Up B": round(up_b, 4),
+                "Sum 2 (Down A+Up B)": round(s2, 4),
                 "Time": datetime.datetime.now().strftime("%H:%M:%S")
             }
 
         # --- Recording Logic ---
         # 1H recording usually doesn't have strict time threshold like 15m (5 mins before close), 
         # but we check thresholds.
-        
+
+        # Check time threshold for 1H markets as well
+        should_record_1h = True
+        try:
+            # 1H markets end at the top of the hour.
+            # We can parse the slug or just assume it closes at next :00.
+            # Actually fetching market data gives 'endDate'.
+            # For simplicity, let's assume standard 1H markets close at the next hour mark relative to their creation.
+            # Or simpler: if current minute > (60 - threshold), stop recording.
+            # e.g. if threshold is 5 mins, stop recording at XX:55.
+            current_minute = datetime.datetime.now().minute
+            if current_minute >= (60 - self.settings.get("arb_time_threshold", 5)):
+                should_record_1h = False
+        except: pass
+
+        # Always update mins_1h structure regardless of recording condition
+        for na, nb, _, _, _, _ in pairs:
+             key = f"{na}-{nb}"
+             if key not in self.mins_1h: self.mins_1h[key] = {"arb_1": 1.0, "arb_2": 1.0}
+
         for na, nb, pa, pb, sa, sb in pairs:
             if not pa or not pb: continue
             
@@ -641,22 +727,48 @@ class MonitorCore:
             s2 = down_a + up_b
             
             key = f"{na}-{nb}"
-            if key not in self.mins_1h: self.mins_1h[key] = {"arb_1": 1.0, "arb_2": 1.0}
             
             thresh = self.settings.get("arb_sum_threshold", 0.8)
             drop = self.settings.get("arb_drop_threshold", 0.03)
             
+            # --- UI Display Update (Always update lowest seen value) ---
+            if s1 < self.mins_1h[key]["arb_1"]:
+                self.mins_1h[key]["arb_1"] = s1
+            if s2 < self.mins_1h[key]["arb_2"]:
+                self.mins_1h[key]["arb_2"] = s2
+
+            # --- Recording to CSV (Conditional) ---
             # Arb 1 (Up A + Down B)
             if s1 <= thresh:
-                if self.mins_1h[key]["arb_1"] == 1.0 or s1 < (self.mins_1h[key]["arb_1"] - drop):
-                    save_arb_opportunity_1h(sa, sb, f"{na}_Up_{nb}_Down", s1, up_a, down_b, key)
-                    self.mins_1h[key]["arb_1"] = s1
+                # We only save if it's a new low or first time (using a separate tracking mechanism ideally, 
+                # but reusing mins_1h logic for "significant drop" check is fine for now, 
+                # provided we understand mins_1h is now "session low")
+                # To avoid spamming CSV, we might need a separate tracker for "last recorded value".
+                # But for simplicity, we'll just save every time it hits threshold if we want full history?
+                # The original logic was: save if < current_min - drop.
+                # Since mins_1h is now real-time low, this logic still holds somewhat, 
+                # but if s1 slowly creeps down, it will update mins_1h but might not trigger "drop" threshold.
+                # Actually, original logic was: if s1 < (self.mins_1h[key]["arb_1"] - drop).
+                # Since we just updated self.mins_1h[key]["arb_1"] = s1 above, this condition s1 < s1 - drop is impossible.
+                # FIX: We need to separate "Session Low" (for UI) from "Last Recorded Low" (for CSV throttling).
+                pass 
+                # Re-implementing correctly below:
             
-            # Arb 2 (Down A + Up B)
+            # Let's use a separate dict for recording thresholds to avoid conflict with UI display
+            if not hasattr(self, 'last_recorded_1h'): self.last_recorded_1h = {}
+            if key not in self.last_recorded_1h: self.last_recorded_1h[key] = {"arb_1": 1.0, "arb_2": 1.0}
+            
+            if not should_record_1h: continue
+
+            if s1 <= thresh:
+                 if self.last_recorded_1h[key]["arb_1"] == 1.0 or s1 < (self.last_recorded_1h[key]["arb_1"] - drop):
+                    save_arb_opportunity_1h(sa, sb, f"{na}_Up_{nb}_Down", s1, up_a, down_b, key)
+                    self.last_recorded_1h[key]["arb_1"] = s1
+
             if s2 <= thresh:
-                if self.mins_1h[key]["arb_2"] == 1.0 or s2 < (self.mins_1h[key]["arb_2"] - drop):
+                 if self.last_recorded_1h[key]["arb_2"] == 1.0 or s2 < (self.last_recorded_1h[key]["arb_2"] - drop):
                     save_arb_opportunity_1h(sa, sb, f"{na}_Down_{nb}_Up", s2, down_a, up_b, key)
-                    self.mins_1h[key]["arb_2"] = s2
+                    self.last_recorded_1h[key]["arb_2"] = s2
 
     def _check_rollover_15m(self):
         try:
@@ -751,6 +863,8 @@ page = st.sidebar.radio("Go to:", ["Monitor", "Monitor 1H", "Arb History", "多�
 st.sidebar.divider()
 st.sidebar.caption("✅ Background Monitor Running")
 st.sidebar.caption(f"15m: {core.btc_slug_15m}")
+st.sidebar.caption(f"    {core.sol_slug_15m}")
+st.sidebar.caption(f"    {core.xrp_slug_15m}")
 st.sidebar.caption(f"1H: {core.btc_slug_1h}")
 st.sidebar.caption(f"    {core.sol_slug_1h}")
 st.sidebar.caption(f"    {core.xrp_slug_1h}")
@@ -771,8 +885,34 @@ with st.sidebar.expander("🛠️ Debug Info", expanded=False):
         st.write(f"Tokens Found: BTC({btc_toks}), ETH({eth_toks})")
         
         if st.button("Force Sync Slugs"):
-            core._sync_slugs_15m()
-            st.rerun()
+             core._sync_slugs_15m()
+             st.rerun()
+
+        st.divider()
+        st.subheader("Raw Prices (15m)")
+        
+        # Display WS Last Update Time for each token
+        if core.tokens_15m:
+            token_status = []
+            for slug, tokens in core.tokens_15m.items():
+                for t in tokens:
+                    tid = t["token_id"]
+                    p_data = core.ws_manager.prices.get(tid, {})
+                    last_ts = p_data.get("ts", 0)
+                    lag = time.time() - last_ts if last_ts > 0 else 999
+                    token_status.append({
+                        "Slug": slug,
+                        "Token": t["outcome"],
+                        "Price": p_data.get("ask"),
+                        "Lag (s)": f"{lag:.1f}"
+                    })
+            st.dataframe(pd.DataFrame(token_status), use_container_width=True)
+
+        if st.button("Show Raw Prices"):
+            # Fetch current prices for BTC/ETH
+            btc_raw = core._get_prices(core.tokens_15m.get(core.btc_slug_15m, []))
+            eth_raw = core._get_prices(core.tokens_15m.get(core.eth_slug_15m, []))
+            st.json({"BTC": btc_raw, "ETH": eth_raw})
 
 # --- Additional Helpers ---
 def fetch_rounds_data(ts_list):
@@ -854,9 +994,10 @@ if page == "Monitor":
     st.title("BTC & ETH 15m Series Monitor 🚀")
     
     # Just display data from core
-    st.info(f"Monitoring: {core.btc_slug_15m} | {core.eth_slug_15m}")
+    st.info(f"Monitoring: {core.btc_slug_15m} | {core.eth_slug_15m} | {core.sol_slug_15m} | {core.xrp_slug_15m}")
     
     if st.button("🔄 Refresh View"):
+        core.force_process()
         st.rerun()
         
     c1, c2 = st.columns(2)
@@ -899,6 +1040,7 @@ elif page == "Monitor 1H":
     st.info(f"Monitoring: {core.btc_slug_1h} | {core.eth_slug_1h} | {core.sol_slug_1h} | {core.xrp_slug_1h}")
     
     if st.button("🔄 Refresh View"):
+        core.force_process()
         st.rerun()
         
     st.subheader("Current Mins (1H)")
