@@ -424,8 +424,10 @@ class MonitorCore:
             public_url = self.settings.get("public_url", "")
             if public_url and public_url.startswith("http"):
                 try:
-                    requests.get(public_url, timeout=10)
-                    print(f"[KeepAlive] Pinged public URL: {public_url}")
+                    # Add ping parameter to trigger early exit and avoid loading full UI
+                    ping_url = public_url + ("?" if "?" not in public_url else "&") + "ping=true"
+                    requests.get(ping_url, timeout=10)
+                    print(f"[KeepAlive] Pinged public URL: {ping_url}")
                 except Exception as e:
                     print(f"[KeepAlive] Failed to ping public URL: {e}")
             
@@ -466,7 +468,7 @@ class MonitorCore:
 
     def _loop(self):
         while self.running:
-            time.sleep(0.5)
+            time.sleep(0.1)
             try:
                 self._sync_slugs_15m()
                 
@@ -828,6 +830,12 @@ def get_monitor_core():
 # --- Main App ---
 st.set_page_config(page_title="Dual Crypto Monitor", layout="wide")
 
+# Check for External Keep-Alive Ping
+if st.query_params.get("ping") == "true":
+    # This will be logged in Streamlit Cloud logs
+    print(f"[KeepAlive] Received external ping at {datetime.datetime.now()}")
+    st.stop()
+
 core = get_monitor_core()
 
 # --- Hotfix for cached instance (Schema Migration) ---
@@ -1111,6 +1119,14 @@ elif page == "Arb History":
             help="Enter your Streamlit Cloud App URL here. The monitor will ping it every minute to prevent sleep.",
             on_change=lambda: st.session_state.update({"public_url": st.session_state.public_url_input}) or save_settings()
         )
+        st.info("""
+        **如何防止休眠 (Anti-Sleep):**
+        1. 在上方输入框填写你的 App 公网 URL。
+        2. 在 GitHub 仓库设置 (Settings -> Secrets and variables -> Actions) 中添加一个 Secret:
+           - Name: `APP_URL`
+           - Value: `你的 App URL` (例如: https://xxx.streamlit.app/)
+        3. 我们已自动创建了 GitHub Action，每 10 分钟会访问一次你的 URL。
+        """)
 
     # Filter Options
     filter_col1, _ = st.columns([2, 4])

@@ -1,0 +1,22 @@
+name: Streamlit Keep Alive
+
+on:
+  schedule:
+    - cron: '*/10 * * * *' # 每 10 分钟运行一次
+  workflow_dispatch: # 允许手动触发
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Streamlit App
+        run: |
+          # 如果你在 GitHub Secrets 里设置了 APP_URL，则使用它；否则尝试从 settings 文件读取（如果已提交）
+          URL="${{ secrets.APP_URL }}"
+          if [ -z "$URL" ]; then
+            # 这里你可以手动填入你的 Streamlit 链接作为备选
+            URL="https://your-app-name.streamlit.app/"
+          fi
+          echo "Pinging $URL..."
+          curl -sL --connect-timeout 20 --max-time 30 "$URL" > /dev/null
+          echo "Ping completed at $(date)"
